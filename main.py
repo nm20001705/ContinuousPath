@@ -2,6 +2,8 @@ import numpy as np
 import trimesh
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+import trimesh
+from scipy.ndimage import binary_erosion
 
 class OuterGeometryProvider:
     def get_contour(self, z: float) -> np.ndarray:
@@ -152,7 +154,7 @@ class ToolpathGenerator:
         self.path_builder = PathBuilder(params)
 
     def build_path(self):
-        layers = int(geometry.height / self.p.layer_height)
+        layers = int(self.geometry.height / self.p.layer_height)
         all_points = []
 
         for i in range(layers):
@@ -235,6 +237,66 @@ class MeshBuilder:
             process=True
         )
 
+class TrimeshGeometry(OuterGeometryProvider):
+    def __init__(self, mesh: trimesh.Trimesh, params):
+        self.params = params
+        self.mesh = mesh
+        self.z_min = mesh.bounds[0][2]
+        self.z_max = mesh.bounds[1][2]
+        self.height = self.z_max - self.z_min
+
+    def get_contour(self, z):
+        section = self.mesh.section(
+            plane_origin=[0, 0, z],
+            plane_normal=[0, 0, 1]
+        )
+
+        if section is None:
+            return np.empty((0, 2))
+
+        # convert to 2D planar coordinates
+        slice_2D, _ = section.to_planar()
+
+        # extract discrete paths
+        paths = slice_2D.discrete
+
+        if len(paths) == 0:
+            return np.empty((0, 2))
+
+        # pick largest loop (outer boundary)
+        largest = max(paths, key=lambda p: self._polygon_area(p))
+
+        return np.array(largest)
+
+    def _polygon_area(self, pts):
+        x = pts[:, 0]
+        y = pts[:, 1]
+        return 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+
+    def hollow_mesh(self):
+        pitch = self.params.line_width
+
+        mesh = self.mesh.copy()
+        mesh = mesh.subdivide_to_size(max_edge=pitch * 2)
+
+        vox = mesh.voxelized(pitch)
+        filled = vox.fill()
+
+        # --- KEY FIX HERE ---
+        matrix = filled.matrix
+
+        # erode inward (controls wall thickness)
+        eroded = binary_erosion(matrix, iterations=1)
+
+        shell = matrix ^ eroded  # XOR → shell
+
+        # rebuild voxel grid
+        shell_vox = trimesh.voxel.VoxelGrid(shell, transform=filled.transform)
+
+        shell_mesh = shell_vox.marching_cubes
+
+        return TrimeshGeometry(shell_mesh, self.params)
+
 # =========================================================
 # MAIN
 # =========================================================
@@ -284,20 +346,12 @@ def plot_path(path, start=0, step=1, stop=None, duration=3):
 
     plt.show()
     return ani
-    
 
 if __name__ == "__main__":
-    params = ContourParams(layer_height=0.2, line_width=0.4, rib_clearance=0.0, grid_angle=45, grid_spacing=5, grid_orientation='z')
-    shape = [(0,0), (20,0), (20,5), (0,5), (0,0)] # assume bottom on print plate
+    params = ContourParams(layer_height=0.1, line_width=0.4, rib_clearance=0.0, grid_angle=45, grid_spacing=5, grid_orientation='z')
+    mesh_stl = trimesh.load(".in/test_wing.stl")
+    geometry = TrimeshGeometry(mesh_stl, params=params).hollow_mesh()
 
-    geometry = CustomShape(shape)
-
-    path_generator = ToolpathGenerator(params, geometry)
-    path = path_generator.build_path()
-    mesh = MeshBuilder(radius=params.radius).build(path)
-
-    print("Watertight:", mesh.is_watertight)
-
-    mesh.export(".out/test.stl")
+    geometry.mesh.export(".out/test.stl")
 
     pass
