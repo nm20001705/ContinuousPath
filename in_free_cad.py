@@ -4,14 +4,14 @@ import math as m
 
 
 # ============================================================
-# PARAMETERS (single source of truth)
+# PARAMETERS
 # ============================================================
 
 class Params:
     """
     Defines a parametric lattice system.
 
-    spacing:
+    grid_spacing:
         Period of the lattice (center-to-center distance).
 
     grid_angle:
@@ -23,28 +23,92 @@ class Params:
     grid_orientation:
         Base orientation of first lattice family (degrees).
 
-    line_width:
-        Used only to derive default thickness scaling (optional legacy).
+    rib_clearance:
+        Absolute gap (in model units) left between a void slab and its
+        neighboring solid ribs on each side. The void slab is made
+        narrower by 2 * rib_clearance before clipping, so the gap is
+        constant regardless of how the clip shape cuts the slab.
+        Must satisfy: 2 * rib_clearance < void_thickness.
     """
 
     def __init__(
         self,
-        grid_spacing,
-        grid_angle,
-        grid_width,
-        grid_orientation=30,
-        line_width=0.4,
-        void_scaling=0.9
+        grid_spacing: float,
+        grid_angle: float,
+        grid_width: float,
+        grid_orientation: float = 30.0,
+        rib_clearance: float = 1.0,
     ):
+        if grid_width >= grid_spacing:
+            raise ValueError("grid_width must be less than grid_spacing")
+        if rib_clearance < 0:
+            raise ValueError("rib_clearance must be >= 0")
+
         self.grid_spacing = grid_spacing
         self.grid_angle = grid_angle
         self.grid_width = grid_width
-
         self.grid_orientation = grid_orientation
-        self.line_width=line_width
-        self.void_scaling = void_scaling
+        self.rib_clearance = rib_clearance
 
-        self.grid_thickness = self.line_width * 2.1  # optional legacy
+    @property
+    def void_thickness(self) -> float:
+        """Full width of the void slot between two solid ribs."""
+        return self.grid_spacing - self.grid_width
+
+    @property
+    def void_slab_thickness(self) -> float:
+        """
+        Actual thickness of the void slab after subtracting clearance on
+        both sides. This is what gets passed to _generate_slabs.
+        """
+        t = self.void_thickness - 2.0 * self.rib_clearance
+        if t <= 0:
+            raise ValueError(
+                f"rib_clearance ({self.rib_clearance}) is too large: "
+                f"void_slab_thickness would be {t:.3f}. "
+                f"Reduce rib_clearance or increase grid_spacing."
+            )
+        return t
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def safe_center(shape: Part.Shape) -> FreeCAD.Vector:
+    """Return center of mass, with fallback for compounds."""
+    if hasattr(shape, "CenterOfMass"):
+        return shape.CenterOfMass
+    try:
+        solids = shape.Solids
+        if solids:
+            return solids[0].CenterOfMass
+    except Exception:
+        pass
+    raise ValueError("Cannot compute center of mass for shape")
+
+
+def is_valid_compound(shape) -> bool:
+    """Return True if shape is non-null and contains at least one solid."""
+    if shape is None or shape.isNull():
+        return False
+    try:
+        return len(shape.Solids) > 0
+    except Exception:
+        return False
+
+
+def fuse_compounds(a: Part.Shape, b: Part.Shape) -> Part.Shape:
+    """
+    Fuse two compounds safely.
+    Falls back to a plain compound if the boolean fuse fails,
+    which is acceptable for use as a cutting tool.
+    """
+    try:
+        return a.fuse(b)
+    except Exception as e:
+        print(f"[warn] fuse failed, falling back to compound: {e}")
+        return Part.makeCompound(a.Solids + b.Solids)
 
 
 # ============================================================
@@ -52,193 +116,246 @@ class Params:
 # ============================================================
 
 class TiltedGrid:
+    """
+    Generates a two-family tilted slab lattice clipped to an arbitrary shape.
+
+    Each family produces:
+      - solid ribs  (grid_width thick)
+      - void slabs  (void_slab_thickness wide = void_thickness - 2*rib_clearance,
+                     sized before clipping so the gap to neighboring ribs is
+                     always approximately rib_clearance in the stacking direction)
+
+    The void compounds from both families are then used to cut the solid ribs.
+    """
+
     def __init__(self, doc, bb, shape, params: Params):
         self.p = params
         self.bb = bb
         self.doc = doc
 
-        self.spacing = params.grid_spacing
-
         self.xlen = bb.XLength
         self.ylen = bb.YLength
         self.zlen = bb.ZLength
 
-        self.diag_xy = m.sqrt(self.xlen**2 + self.ylen**2)
-        self.diag_3d = m.sqrt(self.xlen**2 + self.ylen**2 + self.zlen**2)
-
-        # bounding box for clipping
-        self.bbox_solid = Part.makeBox(
-            self.xlen,
-            self.ylen,
-            self.zlen,
-            FreeCAD.Vector(bb.XMin, bb.YMin, bb.ZMin),
-        )
+        self.diag_xy = m.sqrt(self.xlen ** 2 + self.ylen ** 2)
 
         self.shape = shape.Shape if hasattr(shape, "Shape") else shape
 
-        # center of bounding box
         self.center = FreeCAD.Vector(
             bb.XMin + self.xlen / 2,
             bb.YMin + self.ylen / 2,
             bb.ZMin + self.zlen / 2,
         )
 
+        # Shrunk clip shape for voids — computed once, reused for all families.
+        self.inset_shape = self._make_inset_shape()
+
+    # --------------------------------------------------------
+    # Public entry point
     # --------------------------------------------------------
 
     def make_grid(self):
-        # derived thickness split
-        solid = self.p.grid_thickness
-        void = self.p.grid_spacing -  self.p.grid_thickness - self.p.grid_width
-        print(f'-----------')
-        print(f'grid_spacing {self.p.grid_spacing}')
-        print(f'void {void}')
-        print(f'-----------')
-
         base = self.p.grid_orientation
         offset = self.p.grid_angle
 
-        shapes = []
+        # --- Family 1 ---
+        ribs1 = self._make_ribs(orientation_deg=base, tilt_deg=30)
+        voids1 = self._make_voids(orientation_deg=base, tilt_deg=30)
 
-        s = self.generate_slabs(orientation_deg=base, thickness=solid, tilt_deg=30, phase=0.0)
-        if s: shapes.append(s)
-        u1 = (m.cos(base), m.sin(base), 0)
-        s = self.generate_slabs(orientation_deg=base, thickness=void, tilt_deg=30, phase=0.5, scale=self.p.void_scaling, u=u1)
-        if s: shapes.append(s)
+        # --- Family 2 ---
+        ribs2 = self._make_ribs(orientation_deg=base + offset, tilt_deg=-30)
+        voids2 = self._make_voids(orientation_deg=base + offset, tilt_deg=-30)
 
-        s = self.generate_slabs(orientation_deg=base + offset, thickness=solid, tilt_deg=-30, phase=0.0)
-        if s: shapes.append(s)
-        u2 = (m.cos(base + self.p.grid_angle), m.sin(base + self.p.grid_angle), 0)
-        s = self.generate_slabs(orientation_deg=base + offset, thickness=void, tilt_deg=-30, phase=0.5, scale=self.p.void_scaling, u=u2)
-        if s: shapes.append(s)
-        final = Part.makeCompound(shapes)
+        # --- Cut ribs by all voids ---
+        all_voids = self._combine_voids(voids1, voids2)
+        cut_ribs1 = self._cut_safe(ribs1, all_voids)
+        cut_ribs2 = self._cut_safe(ribs2, all_voids)
 
+        parts = [s for s in [cut_ribs1, cut_ribs2] if is_valid_compound(s)]
+        if not parts:
+            print("[warn] make_grid: no valid geometry produced")
+            return
+
+        final = Part.makeCompound(parts)
         obj = self.doc.addObject("Part::Feature", "FullGrid")
         obj.Shape = final
-
         self.doc.recompute()
 
-    def generate_slabs(self, orientation_deg, thickness, tilt_deg=0, phase=0.0, scale=1, u=None):
+    # --------------------------------------------------------
+    # Private helpers
+    # --------------------------------------------------------
 
-        num_slabs = int(self.diag_xy / self.spacing) + 3
-        slabs = []
+    def _make_inset_shape(self) -> Part.Shape:
+        """
+        Return a uniformly scaled-down copy of self.shape, shrunk by
+        approximately rib_clearance on all sides.
 
-        for i in range(-num_slabs, num_slabs):
-            offset = (i + phase) * self.spacing
+        Scale factor: 1 - rib_clearance / characteristic_radius
+        where characteristic_radius = half the 3D bounding box diagonal.
 
-            slab = Part.makeBox(
-                thickness,
-                self.ylen * 2,
-                self.zlen * 2,
-                FreeCAD.Vector(-thickness/2, -self.ylen, -self.zlen),
+        This is a uniform scale from the shape's center of mass, so the
+        inset distance is only approximate — it will be exact at points
+        that are exactly characteristic_radius from the center, and will
+        vary elsewhere. For a convex, roughly symmetric shape like a wing
+        this is a good enough approximation.
+        """
+        com = self.shape.CenterOfMass
+        char_radius = m.sqrt(self.xlen**2 + self.ylen**2 + self.zlen**2) / 2.0
+        scale = 1.0 - self.p.rib_clearance / char_radius
+
+        if scale <= 0:
+            raise ValueError(
+                f"rib_clearance ({self.p.rib_clearance}) is too large relative "
+                f"to the shape (characteristic_radius={char_radius:.1f}). "
+                f"The inset shape would vanish."
             )
 
-            slab.translate(FreeCAD.Vector(offset, 0, 0))
-
-            slab.rotate(FreeCAD.Vector(0,0,0), FreeCAD.Vector(0,0,1), orientation_deg)
-
-            if tilt_deg != 0:
-                theta = m.radians(orientation_deg)
-                axis = FreeCAD.Vector(-m.sin(theta), m.cos(theta), 0)
-                slab.rotate(FreeCAD.Vector(0,0,0), axis, tilt_deg)
-
-            slab.translate(self.center)
-            clipped_slab = slab.common(self.shape)
-
-            # normalize result to a usable shape
-
-            print(f"\n--- slab {i} ---")
-            print("before clip solids:", len(slab.Solids))
-
-            if clipped_slab.isNull():
-                continue
-
-            if clipped_slab.ShapeType == "Compound":
-                parts = clipped_slab.Solids
-                if not parts:
-                    continue
-                clipped_slab = Part.makeCompound(parts)
-
-            print("after clip valid:", not clipped_slab.isNull())
-            print("shape type:", clipped_slab.ShapeType)
-
-            if scale != 1.0:
-                clipped_slab = self.scale_perpendicular_to_grid(shape=clipped_slab, factor=scale, u=u)
-            slabs.append(clipped_slab)
-
-            print("after scale bbox:", clipped_slab.BoundBox)
-            print("center:", safe_center(clipped_slab))
-
-        return Part.makeCompound(slabs)
-    
-    def scale_perpendicular_to_grid(self, shape, factor, u):
-        com = safe_center(shape)
-
-        u = FreeCAD.Vector(u)
-        u.normalize()
-
-        # build orthonormal frame once per family
-        up = FreeCAD.Vector(0, 0, 1)
-        if abs(u.dot(up)) > 0.99:
-            up = FreeCAD.Vector(0, 1, 0)
-
-        v = up.cross(u)
-        v.normalize()
-
-        w = u.cross(v)
-        w.normalize()
-
-        # rotation matrix (local → world)
-        R = FreeCAD.Matrix()
-        R.A11, R.A12, R.A13 = u.x, v.x, w.x
-        R.A21, R.A22, R.A23 = u.y, v.y, w.y
-        R.A31, R.A32, R.A33 = u.z, v.z, w.z
-
-        Rinv = R.inverse()
-
+        # Translate to origin, scale, translate back
         T1 = FreeCAD.Matrix()
         T1.move(-com)
 
-        # IMPORTANT: no scaling along u (slab direction)
         S = FreeCAD.Matrix()
-        S.A11 = 1.0
-        S.A22 = factor
-        S.A33 = factor
+        S.A11 = scale
+        S.A22 = scale
+        S.A33 = scale
 
         T2 = FreeCAD.Matrix()
         T2.move(com)
 
-        M = T2.multiply(R.multiply(S.multiply(Rinv.multiply(T1))))
+        M = T2.multiply(S.multiply(T1))
+        return self.shape.transformGeometry(M)
 
-        return shape.transformGeometry(M)
-    
-def safe_center(shape):
-    if hasattr(shape, "CenterOfMass"):
-        return shape.CenterOfMass
+    def _make_ribs(self, orientation_deg: float, tilt_deg: float) -> Part.Shape:
+        return self._generate_slabs(
+            orientation_deg=orientation_deg,
+            thickness=self.p.grid_width,
+            tilt_deg=tilt_deg,
+            phase=0.0,
+            clip_shape=self.shape,
+        )
 
-    # fallback for compounds
-    try:
-        solids = shape.Solids
-        if solids:
-            return solids[0].CenterOfMass
-    except:
-        pass
+    def _make_voids(self, orientation_deg: float, tilt_deg: float) -> Part.Shape:
+        return self._generate_slabs(
+            orientation_deg=orientation_deg,
+            thickness=self.p.void_slab_thickness,
+            tilt_deg=tilt_deg,
+            phase=0.5,
+            clip_shape=self.inset_shape,
+        )
 
-    raise ValueError("No valid geometry for COM")
+    def _combine_voids(self, voids1, voids2) -> Part.Shape | None:
+        valid1 = is_valid_compound(voids1)
+        valid2 = is_valid_compound(voids2)
+        if valid1 and valid2:
+            return fuse_compounds(voids1, voids2)
+        if valid1:
+            return voids1
+        if valid2:
+            return voids2
+        return None
+
+    def _cut_safe(self, ribs: Part.Shape, voids: Part.Shape) -> Part.Shape | None:
+        if not is_valid_compound(ribs):
+            return None
+        if not is_valid_compound(voids):
+            return ribs
+        try:
+            return ribs.cut(voids)
+        except Exception as e:
+            print(f"[warn] cut failed: {e}")
+            return ribs
+
+    def _generate_slabs(
+        self,
+        orientation_deg: float,
+        thickness: float,
+        tilt_deg: float = 0.0,
+        phase: float = 0.0,
+        clip_shape: Part.Shape = None,
+    ) -> Part.Shape:
+        """
+        Generate clipped slabs for one family at one phase.
+
+        orientation_deg: in-plane rotation of the slab family (degrees)
+        thickness:       slab width in the stacking direction (pre-clipping)
+        tilt_deg:        out-of-plane tilt around the rib axis (degrees)
+        phase:           fractional offset within one period (0 = rib, 0.5 = void)
+        clip_shape:      shape to intersect with; defaults to self.shape
+        """
+        clip = clip_shape if clip_shape is not None else self.shape
+        num_slabs = int(self.diag_xy / self.p.grid_spacing) + 3
+        slabs = []
+
+        for i in range(-num_slabs, num_slabs):
+            slab = self._build_single_slab(
+                index=i,
+                phase=phase,
+                thickness=thickness,
+                orientation_deg=orientation_deg,
+                tilt_deg=tilt_deg,
+            )
+
+            clipped = slab.common(clip)
+
+            if clipped.isNull():
+                continue
+
+            if clipped.ShapeType == "Compound":
+                solids = clipped.Solids
+                if not solids:
+                    continue
+                clipped = Part.makeCompound(solids)
+
+            slabs.append(clipped)
+
+        if not slabs:
+            return Part.makeCompound([])
+
+        return Part.makeCompound(slabs)
+
+    def _build_single_slab(
+        self,
+        index: int,
+        phase: float,
+        thickness: float,
+        orientation_deg: float,
+        tilt_deg: float,
+    ) -> Part.Shape:
+        """Build one unclipped slab box, positioned and rotated."""
+        offset = (index + phase) * self.p.grid_spacing
+
+        slab = Part.makeBox(
+            thickness,
+            self.ylen * 2,
+            self.zlen * 2,
+            FreeCAD.Vector(-thickness / 2, -self.ylen, -self.zlen),
+        )
+
+        slab.translate(FreeCAD.Vector(offset, 0, 0))
+        slab.rotate(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(0, 0, 1), orientation_deg)
+
+        if tilt_deg != 0.0:
+            theta = m.radians(orientation_deg)
+            tilt_axis = FreeCAD.Vector(-m.sin(theta), m.cos(theta), 0)
+            slab.rotate(FreeCAD.Vector(0, 0, 0), tilt_axis, tilt_deg)
+
+        slab.translate(self.center)
+        return slab
+
+
 # ============================================================
 # FACE ANALYSIS
 # ============================================================
 
 class FaceAnalyzer:
-    """
-    Utility class for geometric face inspection.
-    """
+    """Utility class for geometric face inspection."""
 
     @staticmethod
-    def centroid(face):
+    def centroid(face) -> FreeCAD.Vector:
         return face.CenterOfMass
 
     @staticmethod
-    def normal(face):
+    def normal(face) -> FreeCAD.Vector:
         n = face.normalAt(0.5, 0.5)
         n.normalize()
         return n
@@ -253,68 +370,39 @@ class ThicknessBuilder:
     Builds a solid from one or two selected faces.
 
     Rules:
-    - 1 face:
-        → extrude along face normal
-    - 2 faces:
-        → bottom = lowest centroid Z
-        → top = highest centroid Z
-        → build enclosed solid
+      1 face  → extrude along face normal by `thickness`
+      2 faces → shell between bottom (min Z centroid) and top (max Z centroid)
+
+    Note: the 2-face shell path requires the two faces to share a compatible
+    boundary for Part.makeShell to produce a closed solid. If the faces are
+    non-planar or non-matching this will raise.
     """
 
-    def __init__(self, shape):
+    def __init__(self, shape: Part.Shape):
         self.shape = shape
         self.faces = shape.Faces
-
-        if len(self.faces) == 0:
+        if not self.faces:
             raise ValueError("Shape has no faces")
 
-    # --------------------------------------------------------
-
-    def build(self, thickness=None):
-        """
-        Returns a solid based on face configuration.
-        """
-
+    def build(self, thickness: float = None) -> Part.Shape:
         if len(self.faces) == 1:
             return self._from_single_face(thickness)
+        return self._from_two_faces()
 
-        if len(self.faces) >= 2:
-            return self._from_two_faces()
-
-        raise ValueError("Unsupported geometry")
-
-    # --------------------------------------------------------
-
-    def _from_single_face(self, thickness):
+    def _from_single_face(self, thickness: float) -> Part.Shape:
         face = self.faces[0]
-
         n = FaceAnalyzer.normal(face)
+        t = thickness if thickness is not None else 1.0
+        return face.extrude(n.multiply(t))
 
-        if thickness is None:
-            thickness = 1.0
-
-        solid = face.extrude(n.multiply(thickness))
-        return solid
-
-    # --------------------------------------------------------
-
-    def _from_two_faces(self):
-        # sort faces by centroid Z
-        sorted_faces = sorted(
-            self.faces,
-            key=lambda f: FaceAnalyzer.centroid(f).z
-        )
-
+    def _from_two_faces(self) -> Part.Shape:
+        sorted_faces = sorted(self.faces, key=lambda f: FaceAnalyzer.centroid(f).z)
         bottom = sorted_faces[0]
         top = sorted_faces[-1]
-
-        # attempt shell construction
+        # NOTE: makeShell from 2 open faces will only produce a valid closed
+        # solid if the faces share a compatible boundary edge loop.
         shell = Part.makeShell([bottom, top])
-
-        # convert to solid
-        solid = Part.Solid(shell)
-
-        return solid
+        return Part.Solid(shell)
 
 
 # ============================================================
@@ -322,128 +410,59 @@ class ThicknessBuilder:
 # ============================================================
 
 class ThicknessGenerator:
-    """
-    User-facing interface.
-    """
+    """User-facing interface for ThicknessBuilder."""
 
     def __init__(self, doc):
         self.doc = doc
 
-    def from_object(self, obj_name, out_name="ThickSolid", thickness=None):
+    def from_object(
+        self, obj_name: str, out_name: str = "ThickSolid", thickness: float = None
+    ):
         obj = self.doc.getObject(obj_name)
+        if obj is None:
+            raise ValueError(f"Object '{obj_name}' not found in document")
 
         builder = ThicknessBuilder(obj.Shape)
         solid = builder.build(thickness=thickness)
 
         out = self.doc.addObject("Part::Feature", out_name)
         out.Shape = solid
-
         self.doc.recompute()
         return out
 
+
 # ============================================================
-# MAIN
+# DIAGNOSTICS
 # ============================================================
-
-def make_thickness():
-    full_wing = doc.getObject("Pad")
-    lowest_face = min(faces, key=lambda f: f.CenterOfMass.z)
-    highest_face = max(faces, key=lambda f: f.CenterOfMass.z)
-
-    # --------------------------------------------------------
-    # visualization (fixed naming)
-    # --------------------------------------------------------
-
-    viz_low = doc.addObject("Part::Feature", "LowestFaceViz")
-    viz_low.Shape = lowest_face
-
-    viz_high = doc.addObject("Part::Feature", "HighestFaceViz")
-    viz_high.Shape = highest_face
-
-    # --------------------------------------------------------
-    # thickness operation
-    # --------------------------------------------------------
-
-    try:
-        hollow_wing = full_wing.Shape.makeThickness(
-            [lowest_face, highest_face],
-            0.2,
-            0.001
-        )
-
-        out = doc.addObject("Part::Feature", "HollowWing")
-        out.Shape = hollow_wing
-
-    except Exception as e:
-        print("Thickness operation failed:", e)
-
-    doc.recompute()  
 
 def see_objects(doc):
     for o in doc.Objects:
         print(o.Name, "|", o.Label, "|", o.TypeId)
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 if __name__ == "__main__":
 
     p = Params(
         grid_spacing=30,
-        line_width = 0.4,
         grid_angle=0,
         grid_orientation=0,
-        grid_width = 0, 
-        void_scaling = 0.6
+        grid_width=0.84,
+        rib_clearance=2.0,   # 2mm gap between void slab and neighboring solid rib
     )
 
-    docect_path = r"C:\Users\natha\git\ContinuousPath\wing.FCStd"
-    doc = FreeCAD.open(docect_path)
+    doc_path = r"C:\Users\natha\git\ContinuousPath\wing.FCStd"
+    doc = FreeCAD.open(doc_path)
 
     see_objects(doc)
 
     full_wing = doc.getObject("Pad")
     bb = full_wing.Shape.BoundBox
+
     grid = TiltedGrid(bb=bb, params=p, shape=full_wing, doc=doc)
     grid.make_grid()
 
-
-    # center = full_wing.Shape.CenterOfMass
-    # factor = 0.9  # 90% size
-    # mat = FreeCAD.Matrix()
-
-    # mat.A11 = factor
-    # mat.A22 = factor
-    # mat.A33 = factor
-
-    # scaled = full_wing.Shape.copy()
-    # scaled = scaled.transformGeometry(mat)
-
-    # # --------------------------------------------------------
-    # # move back to center correctly
-    # # --------------------------------------------------------
-    # shift = FreeCAD.Vector(
-    #     center.x * (1 - factor),
-    #     center.y * (1 - factor),
-    #     center.z * (1 - factor),
-    # )
-
-    # scaled.translate(-shift)
-
-    # # --------------------------------------------------------
-    # # show result
-    # # --------------------------------------------------------
-    # inner = doc.addObject("Part::Feature", "InnerShape")
-    # inner.Shape = scaled
-
     doc.recompute()
-
-
-
-
-
-
-
-
-    
-    # make_grid(doc=doc, bb=bb, p=p, shape=full_wing.Shape)
-    # tg = ThicknessGenerator(doc)
-    # tg.from_object(obj_name="Pad")
