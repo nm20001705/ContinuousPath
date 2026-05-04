@@ -1,7 +1,6 @@
 import FreeCAD
 import Part
 import math
-import itertools
 
 # ============================================================
 # PARAMETERS
@@ -30,7 +29,6 @@ class LWInfillParams:
                  grid_orientation   = 0.0,
                  primary_dir        = None,
                  construction_plane = 'XZ'):
-
         if construction_plane not in PLANE_DEFS:
             raise ValueError(f"construction_plane must be one of {list(PLANE_DEFS.keys())}")
 
@@ -46,7 +44,6 @@ class LWInfillParams:
         self.plane_normal = pdef['normal']
         self.plane_axis_u = pdef['axis_u']
         self.plane_axis_v = pdef['axis_v']
-
         self.primary_dir = self._project_primary(primary_dir)
 
     def _project_primary(self, pd):
@@ -147,7 +144,6 @@ def create_angled_grid_lines(bb, params):
                                   d.z*n.x - d.x*n.z,
                                   d.x*n.y - d.y*n.x)
         stacking.normalize()
-
         proj_vals = [dot(c, stacking) for c in corners]
         min_p = min(proj_vals)
         max_p = max(proj_vals)
@@ -196,7 +192,6 @@ def create_rib_faces(lines, plane_normal, rib_width):
 def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, bridge_size=None):
     if bridge_size is None:
         bridge_size = rib_width * 0.5
-
     if cut_body.ShapeType in ("Compound", "CompSolid"):
         solids = cut_body.Solids
     else:
@@ -209,7 +204,6 @@ def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, 
         start = line.Vertexes[0].Point
         end = line.Vertexes[-1].Point
         mid = (start + end) * 0.5
-
         rib_dir = (end - start).normalize()
         span_dir = n
         third_dir = rib_dir.cross(span_dir).normalize()
@@ -221,20 +215,17 @@ def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, 
         box = Part.makeBox(len_along_rib, len_along_span, len_along_third)
         box.translate(FreeCAD.Vector(-len_along_rib/2, -len_along_span/2, -len_along_third/2))
 
-        # Build rotation matrix
         mat = FreeCAD.Matrix()
         mat.A11 = rib_dir.x;   mat.A12 = span_dir.x;   mat.A13 = third_dir.x
         mat.A21 = rib_dir.y;   mat.A22 = span_dir.y;   mat.A23 = third_dir.y
         mat.A31 = rib_dir.z;   mat.A32 = span_dir.z;   mat.A33 = third_dir.z
         mat.A44 = 1.0
-
         rot = FreeCAD.Rotation(mat)
         box.Placement = FreeCAD.Placement(mid, rot)
         bridges.append(box)
 
     if not bridges:
         return cut_body
-
     all_parts = solids + bridges
     unified = all_parts[0]
     for p in all_parts[1:]:
@@ -248,7 +239,6 @@ def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, 
 def create_cut_result(body, params, doc=None):
     if doc is None:
         doc = FreeCAD.ActiveDocument
-
     raw_shape = body.Shape if hasattr(body, "Shape") else body
     bb = raw_shape.BoundBox
 
@@ -323,99 +313,99 @@ def generate_lw_infill(body, params, doc=None):
 
 
 # ============================================================
-# MIDPOINT COLLECTION AND CURVE VISUALIZATION
+# NEW: POINT COLLECTION AND RIB ASSIGNMENT
 # ============================================================
-def collect_midpoints_from_slices(cut_body, z_min, z_max, z_step):
-    if cut_body.ShapeType in ("Compound", "CompSolid"):
+def collect_midpoints_per_rib(cut_body, rib_center_lines, z_min, z_max, z_step, max_dist=5.0):
+    """
+    Slice cut_body horizontally, collect midpoints of intersection edges,
+    assign each midpoint to the nearest rib centre line.
+    """
+    ribs = list(enumerate(rib_center_lines))
+    points_by_rib = {idx: [] for idx, _ in ribs}
+
+    # Get list of solids (handle compound or single shape)
+    if hasattr(cut_body, 'Solids') and cut_body.Solids:
         solids = cut_body.Solids
     else:
         solids = [cut_body]
 
-    all_points = []
+    def process_edge(edge, points_dict):
+        if len(edge.Vertexes) >= 2:
+            p1 = edge.Vertexes[0].Point
+            p2 = edge.Vertexes[-1].Point
+            mid = (p1 + p2) * 0.5
+            best_idx = None
+            best_dist = float('inf')
+            for idx, line in ribs:
+                start = line.Vertexes[0].Point
+                end = line.Vertexes[-1].Point
+                line_dir = (end - start).normalize()
+                t = (mid - start).dot(line_dir)
+                if t < 0:
+                    dist = mid.distanceToPoint(start)
+                elif t > (end - start).Length:
+                    dist = mid.distanceToPoint(end)
+                else:
+                    proj = start + line_dir * t
+                    dist = mid.distanceToPoint(proj)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            if best_idx is not None and best_dist <= max_dist:
+                points_dict[best_idx].append(mid)
+
     z = z_min
     while z <= z_max:
-        plane_origin = FreeCAD.Vector(0, 0, z)
-        plane_normal = FreeCAD.Vector(0, 0, 1)
+        direction = FreeCAD.Vector(0, 0, 1)
+        distance = z
         for solid in solids:
             try:
-                section = solid.section(plane_origin, plane_normal)
-                for edge in section.Edges:
-                    if len(edge.Vertexes) >= 2:
-                        p1 = edge.Vertexes[0].Point
-                        p2 = edge.Vertexes[-1].Point
-                        all_points.append((p1 + p2) * 0.5)
+                slice_result = solid.slice(direction, distance)
+                # slice_result can be a Compound or a list of Compounds
+                if hasattr(slice_result, 'Edges'):
+                    for edge in slice_result.Edges:
+                        process_edge(edge, points_by_rib)
+                elif isinstance(slice_result, list):
+                    for item in slice_result:
+                        if hasattr(item, 'Edges'):
+                            for edge in item.Edges:
+                                process_edge(edge, points_by_rib)
+                else:
+                    # fallback: try to iterate edges directly
+                    try:
+                        for edge in slice_result.Edges:
+                            process_edge(edge, points_by_rib)
+                    except:
+                        pass
             except Exception:
-                continue
+                # fallback to section
+                try:
+                    section = solid.section(FreeCAD.Vector(0,0,z), direction)
+                    for edge in section.Edges:
+                        process_edge(edge, points_by_rib)
+                except Exception:
+                    continue
         z += z_step
-    return all_points
+    return points_by_rib
 
 
-def cluster_points_by_proximity(points, distance_threshold=5.0):
-    """
-    Simple clustering: start with first unassigned point, collect all points within distance.
-    Returns list of clusters (each a list of points).
-    """
-    if not points:
-        return []
-    points_copy = list(points)
-    clusters = []
-    while points_copy:
-        seed = points_copy.pop(0)
-        cluster = [seed]
-        i = 0
-        while i < len(points_copy):
-            p = points_copy[i]
-            if min(p.distanceToPoint(q) for q in cluster) < distance_threshold:
-                cluster.append(points_copy.pop(i))
-            else:
-                i += 1
-        clusters.append(cluster)
-    return clusters
-
-
-def create_curves_from_clusters(clusters, doc):
-    """Create a separate compound of wires/curves for all clusters."""
-    curves = []
-    for cluster in clusters:
-        if len(cluster) < 2:
+def show_points_per_rib(points_by_rib, doc):
+    """Create one point cloud object per rib."""
+    count = 0
+    for idx, pts in points_by_rib.items():
+        if not pts:
             continue
-        # Sort by Z coordinate (since slices are horizontal)
-        cluster_sorted = sorted(cluster, key=lambda p: p.z)
-        # Create a polyline (or use BSpline for smoothness)
-        polyline = Part.makePolygon(cluster_sorted)
-        # The last point repeats the first, so we need to drop the extra
-        if len(cluster_sorted) > 2:
-            # Remove the final closing edge
-            edges = polyline.Edges[:-1]
-            wire = Part.Wire(edges)
-        else:
-            wire = Part.Wire(polyline)
-        curves.append(wire)
-
-    if not curves:
-        return None
-    compound = Part.Compound(curves)
-    obj = doc.addObject("Part::Feature", "RibCentreLines")
-    obj.Shape = compound
+        vertices = [Part.Vertex(p) for p in pts]
+        compound = Part.Compound(vertices)
+        obj = doc.addObject("Part::Feature", f"RibPoints_{idx}")
+        obj.Shape = compound
+        count += 1
     doc.recompute()
-    print(f"Created {len(curves)} rib centre curves (total {sum(len(c) for c in clusters)} points)")
-    return obj
-
-
-def visualize_rib_centre_lines(cut_body, z_step=0.5, distance_threshold=5.0, doc=None):
-    bb = cut_body.BoundBox
-    z_min = bb.ZMin + 0.1
-    z_max = bb.ZMax - 0.1
-    points = collect_midpoints_from_slices(cut_body, z_min, z_max, z_step)
-    if not points:
-        print("No midpoints collected.")
-        return
-    clusters = cluster_points_by_proximity(points, distance_threshold)
-    create_curves_from_clusters(clusters, doc)
+    print(f"Visualized {count} ribs with points (total points = {sum(len(p) for p in points_by_rib.values())})")
 
 
 # ============================================================
-# MAIN
+# MAIN (single, clean block)
 # ============================================================
 if __name__ == "__main__":
     doc_path = r"C:\Users\natha\git\ContinuousPath\wing.FCStd"
@@ -425,9 +415,10 @@ if __name__ == "__main__":
     if not wing:
         raise RuntimeError("Object 'Pad' not found in document.")
 
+    # Use smaller rib_spacing to ensure ribs exist
     params = LWInfillParams(
         nozzle_diameter  = 0.4,
-        rib_spacing      = 40.0,
+        rib_spacing      = 70.0,          # smaller than 40 to get ribs
         rib_width        = 0.1,
         rib_angle        = 30.0,
         grid_orientation = 0.0,
@@ -435,19 +426,34 @@ if __name__ == "__main__":
         construction_plane = 'XZ'
     )
 
-    # --- Get rib centre lines (directly from generation) ---
-    bb = wing.Shape.BoundBox
-    lines1, lines2 = create_angled_grid_lines(bb, params)
-    all_lines = lines1 + lines2
+    # 1. Create cut result (wing minus ribs)
+    cut_result, all_center_lines = create_cut_result(wing.Shape, params, doc)
+    print("Cut created.")
 
-    # --- Create a compound of these lines and add to document as a separate object ---
-    compounds = [line for line in all_lines]  # list of edges
-    rib_lines_compound = Part.Compound(compounds)
+    # 2. Visualise original rib centre lines
+    rib_lines_compound = Part.Compound([line for line in all_center_lines])
     obj_lines = doc.addObject("Part::Feature", "RibCentreLines")
     obj_lines.Shape = rib_lines_compound
     doc.recompute()
-    print(f"Visualized {len(all_lines)} rib centre lines.")
+    print(f"Visualized {len(all_center_lines)} rib centre lines.")
 
-    # --- Now also generate the final solid with bridges if desired ---
-    result_body = generate_lw_infill(wing.Shape, params, doc)
-    print("Lightweight wing with bridges created successfully.")
+    # 3. Slice range
+    bb = cut_result.BoundBox
+    if bb.ZMax - bb.ZMin < 1.0:
+        print("Wing height too small – cannot slice.")
+    else:
+        z_min = bb.ZMin + 0.5
+        z_max = bb.ZMax - 0.5
+        z_step = 10.0
+        print(f"Slicing from z={z_min:.1f} to {z_max:.1f} step {z_step:.1f}")
+
+        # 4. Collect and assign midpoints
+        points_by_rib = collect_midpoints_per_rib(cut_result, all_center_lines,
+                                                  z_min, z_max, z_step, max_dist=5.0)
+
+        # 5. Show point clouds per rib
+        show_points_per_rib(points_by_rib, doc)
+
+    # (Optional) Generate final solid with bridges
+    # result_body = generate_lw_infill(wing.Shape, params, doc)
+    # print("Lightweight wing with bridges created successfully.")
