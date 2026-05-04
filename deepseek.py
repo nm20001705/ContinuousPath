@@ -281,3 +281,4 @@ if __name__ == "__main__":
     obj.Shape = result_body
     doc.recompute()
     print("Lightweight wing created successfully.")
+    
