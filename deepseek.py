@@ -1,284 +1,418 @@
 import FreeCAD
 import Part
-import math
-import numpy as np
+import math as m
+
 
 # ============================================================
 # PARAMETERS
 # ============================================================
+
 class LWInfillParams:
-    def __init__(self,
-                 nozzle_diameter    = 0.4,
-                 wall_thickness     = None,
-                 rib_spacing        = 5.0,
-                 rib_width          = None,
-                 split_angle        = 45.0,
-                 chord_curves       = None,
-                 guide_rails        = None,
-                 rib_angle          = 30.0):   # degrees, half-angle between rib families
-        self.nozzle_diameter = nozzle_diameter
-        self.wall_thickness = wall_thickness or nozzle_diameter
-        self.rib_spacing = rib_spacing
-        self.rib_width = rib_width or (2.0 * nozzle_diameter)
-        self.split_angle = split_angle
-        self.chord_curves = chord_curves
-        self.guide_rails = guide_rails
-        self.rib_angle = rib_angle
+    """
+    Parameters for a two-family tilted slab lattice with elliptical
+    lightening holes, designed for LW-PLA vase-mode printing.
+
+    nozzle_diameter:
+        Nozzle width (mm). Used to derive rib_width if not set explicitly.
+
+    rib_spacing:
+        Center-to-center distance between ribs within one family (mm).
+
+    rib_width:
+        Thickness of each rib slab (mm). Defaults to 2 * nozzle_diameter.
+
+    rib_angle:
+        Half-angle between the two rib families (degrees).
+        Family 1 runs at +rib_angle from primary_dir,
+        family 2 runs at -rib_angle from primary_dir.
+
+    tilt_deg:
+        Out-of-plane tilt of each family around its own rib axis (degrees).
+        Family 1 tilts +tilt_deg, family 2 tilts -tilt_deg.
+        This makes the crossing vector horizontal (in XY) rather than vertical.
+
+    grid_orientation:
+        Global rotation of both families around Z (degrees).
+
+    primary_dir:
+        Optional span direction (FreeCAD.Vector in XY).
+        If None, the longer bounding box axis is used.
+
+    hole_margin:
+        Minimum material between ellipse edge and rib boundary (mm).
+        Enforced in the canonical frame before tilting.
+
+    min_hole_size:
+        Skip lightening if both semi-axes are smaller than this (mm).
+    """
+
+    def __init__(
+        self,
+        nozzle_diameter  = 0.4,
+        rib_spacing      = 10.0,
+        rib_width        = None,
+        rib_angle        = 30.0,
+        tilt_deg         = 30.0,
+        grid_orientation = 0.0,
+        primary_dir      = None,
+        hole_margin      = 1.0,
+        min_hole_size    = 4.0,
+    ):
+        self.nozzle_diameter  = nozzle_diameter
+        self.rib_spacing      = rib_spacing
+        self.rib_width        = rib_width or (2.0 * nozzle_diameter)
+        self.rib_angle        = rib_angle
+        self.tilt_deg         = tilt_deg
+        self.grid_orientation = grid_orientation
+        self.primary_dir      = primary_dir
+        self.hole_margin      = hole_margin
+        self.min_hole_size    = min_hole_size
+
+    @property
+    def semi_major(self) -> float:
+        """
+        Half-length of the ellipse along the rib (X in canonical frame).
+        Capped at rib_spacing/2 - hole_margin so holes never reach node regions.
+        """
+        return self.rib_spacing / 2.0 - self.hole_margin
+
+    @property
+    def semi_minor(self) -> float:
+        """
+        Half-width of the ellipse across the rib (Y in canonical frame).
+        Capped at rib_width/2 - hole_margin so holes never reach slab edges.
+        """
+        return self.rib_width / 2.0 - self.hole_margin
+
+    def validate(self):
+        if self.semi_minor <= 0:
+            raise ValueError(
+                f"hole_margin ({self.hole_margin}) too large for "
+                f"rib_width ({self.rib_width}): semi_minor = {self.semi_minor:.3f}."
+            )
+        if self.semi_major <= 0:
+            raise ValueError(
+                f"hole_margin ({self.hole_margin}) too large for "
+                f"rib_spacing ({self.rib_spacing}): semi_major = {self.semi_major:.3f}."
+            )
 
 
 # ============================================================
-# FACE SELECTION (automatic)
+# HELPERS
 # ============================================================
-def find_bottom_face(body):
-    """
-    Return the face whose centre of mass has the smallest Z coordinate.
-    (Usually the flat bottom of the wing, best for drawing the grid.)
-    """
-    best_face = None
-    best_z = float('inf')
-    for face in body.Faces:
-        try:
-            com = face.CenterOfMass
-            if com.z < best_z:
-                best_z = com.z
-                best_face = face
-        except Exception:
-            pass
-    return best_face
+
+def is_valid(shape) -> bool:
+    if shape is None or shape.isNull():
+        return False
+    try:
+        return len(shape.Solids) > 0
+    except Exception:
+        return False
+
+
+def safe_fuse(a: Part.Shape, b: Part.Shape) -> Part.Shape:
+    if not is_valid(a):
+        return b
+    if not is_valid(b):
+        return a
+    try:
+        return a.fuse(b)
+    except Exception as e:
+        print(f"[warn] fuse failed, using compound: {e}")
+        return Part.makeCompound(a.Solids + b.Solids)
 
 
 # ============================================================
-# GRID LINE GENERATION
+# FAMILY DIRECTION COMPUTATION
 # ============================================================
-def create_angled_grid_lines(face, spacing, angle_deg):
-    """
-    Generate two families of parallel lines on the face,
-    at +angle_deg and -angle_deg relative to the face's long axis.
-    Returns (lines_family1, lines_family2).
-    """
-    bb = face.BoundBox
-    z = bb.ZMin   # work on the horizontal plane of the face
 
-    # Determine the primary axis (longer side of the bounding box)
-    if bb.XLength > bb.YLength:
-        primary_dir = FreeCAD.Vector(1, 0, 0)   # X is span
+def compute_family_directions(bb, params: LWInfillParams):
+    """
+    Compute the rib direction vectors for both families.
+
+    Returns (dir1, dir2) — unit vectors in XY for each family.
+
+    The primary direction is either user-supplied or derived from the
+    longer bounding box axis. Each family is rotated ±rib_angle from
+    primary, then the whole grid is rotated by grid_orientation.
+    """
+    # Primary direction
+    if params.primary_dir is not None:
+        pd = FreeCAD.Vector(params.primary_dir.x, params.primary_dir.y, 0)
+        pd.normalize()
     else:
-        primary_dir = FreeCAD.Vector(0, 1, 0)   # Y is span
+        if bb.XLength >= bb.YLength:
+            pd = FreeCAD.Vector(1, 0, 0)
+        else:
+            pd = FreeCAD.Vector(0, 1, 0)
 
-    # Perpendicular horizontal vector
-    perp_primary = FreeCAD.Vector(-primary_dir.y, primary_dir.x, 0)
+    # Perpendicular to primary in XY
+    perp = FreeCAD.Vector(-pd.y, pd.x, 0)
 
-    # Direction vectors for the two rib families
-    angle_rad = math.radians(angle_deg)
-    v1 = primary_dir * math.cos(angle_rad) + perp_primary * math.sin(angle_rad)
-    v2 = primary_dir * math.cos(angle_rad) - perp_primary * math.sin(angle_rad)
+    ang = m.radians(params.rib_angle)
+    rot = m.radians(params.grid_orientation)
 
-    # Bounding box corners in 2D (XY plane at z)
-    corners_2d = [
-        FreeCAD.Vector(bb.XMin, bb.YMin, z),
-        FreeCAD.Vector(bb.XMax, bb.YMin, z),
-        FreeCAD.Vector(bb.XMin, bb.YMax, z),
-        FreeCAD.Vector(bb.XMax, bb.YMax, z)
-    ]
+    def rotate_xy(v, angle):
+        return FreeCAD.Vector(
+            v.x * m.cos(angle) - v.y * m.sin(angle),
+            v.x * m.sin(angle) + v.y * m.cos(angle),
+            0,
+        )
 
-    def generate_lines(v):
-        # Perpendicular direction in XY plane
-        perp = FreeCAD.Vector(-v.y, v.x, 0)
-        # Project all corners onto perp to get the range
-        proj_vals = [c.dot(perp) for c in corners_2d]
-        min_proj = min(proj_vals)
-        max_proj = max(proj_vals)
+    # Family directions before global rotation
+    d1_local = FreeCAD.Vector(
+        pd.x * m.cos(ang) + perp.x * m.sin(ang),
+        pd.y * m.cos(ang) + perp.y * m.sin(ang),
+        0,
+    )
+    d2_local = FreeCAD.Vector(
+        pd.x * m.cos(ang) - perp.x * m.sin(ang),
+        pd.y * m.cos(ang) - perp.y * m.sin(ang),
+        0,
+    )
 
-        # Number of lines needed
-        num_lines = int((max_proj - min_proj) / spacing) + 3
-        center_pt = FreeCAD.Vector(bb.Center.x, bb.Center.y, z)
-        line_len = max(bb.XLength, bb.YLength) * 3   # generous over‑coverage
+    dir1 = rotate_xy(d1_local, rot)
+    dir2 = rotate_xy(d2_local, rot)
+    dir1.normalize()
+    dir2.normalize()
 
-        lines = []
-        for i in range(-1, num_lines + 1):
-            offset = min_proj + i * spacing
-            # Move the center point perpendicularly to the correct offset
-            p0 = center_pt + perp * (offset - center_pt.dot(perp))
-            line_start = p0 - v * line_len
-            line_end   = p0 + v * line_len
-            lines.append(Part.makeLine(line_start, line_end))
-        return lines
-
-    return generate_lines(v1), generate_lines(v2)
+    return dir1, dir2
 
 
 # ============================================================
-# CREATE THIN RIB FACES FROM LINES
+# SLAB BUILDER
 # ============================================================
-def create_rib_faces(lines, plane_normal, rib_width):
+
+class SlabFamily:
     """
-    Convert each line into a thin rectangular face oriented perpendicular
-    to the plane (i.e., vertical for vase printing).
+    Builds one family of tilted lightened slabs.
+
+    In the canonical frame:
+      - The slab runs along X (the rib direction)
+      - The slab cross-section is rib_width in Y, oversized in Z
+      - Elliptical holes are cut periodically along X before any rotation
+
+    Then the slab is:
+      1. Rotated in XY to align with the family direction
+      2. Tilted around its own rib axis by tilt_deg
+      3. Translated to the correct position
+      4. Clipped to the wing shape
     """
-    half_w = rib_width / 2.0
-    faces = []
-    for line in lines:
-        try:
-            start = line.Vertexes[0].Point
-            end = line.Vertexes[-1].Point
-            dir_vec = (end - start).normalize()
-            # A vector perpendicular to the line AND to the plane normal (so the face is vertical)
-            perp = dir_vec.cross(plane_normal).normalize() * half_w
-            p1 = start + perp
-            p2 = start - perp
-            p3 = end - perp
-            p4 = end + perp
-            wire = Part.makePolygon([p1, p2, p3, p4, p1])
-            faces.append(Part.Face(wire))
-        except Exception:
-            pass
-    return faces
+
+    def __init__(self, shape: Part.Shape, params: LWInfillParams,
+                 direction: FreeCAD.Vector, tilt_deg: float):
+        self.shape     = shape
+        self.p         = params
+        self.direction = direction   # unit vector in XY
+        self.tilt_deg  = tilt_deg
+
+        bb = shape.BoundBox
+        self.bb      = bb
+        self.xlen    = bb.XLength
+        self.ylen    = bb.YLength
+        self.zlen    = bb.ZLength
+        self.diag_xy = m.sqrt(self.xlen**2 + self.ylen**2)
+        self.diag_3d = m.sqrt(self.xlen**2 + self.ylen**2 + self.zlen**2)
+
+        self.center = FreeCAD.Vector(
+            bb.XMin + self.xlen / 2,
+            bb.YMin + self.ylen / 2,
+            bb.ZMin + self.zlen / 2,
+        )
+
+        # Orientation angle of this family (degrees, measured from X axis)
+        self.orientation_deg = m.degrees(m.atan2(direction.y, direction.x))
+
+        # Tilt axis = in-plane perpendicular to the rib direction
+        self.tilt_axis = FreeCAD.Vector(-direction.y, direction.x, 0)
+
+    def build(self) -> Part.Shape:
+        """Build all slabs for this family, clipped to the wing shape."""
+        # Project bounding box corners onto the family direction to get
+        # tight iteration bounds (avoids generating slabs far outside shape)
+        corners = [
+            FreeCAD.Vector(self.bb.XMin, self.bb.YMin, 0),
+            FreeCAD.Vector(self.bb.XMax, self.bb.YMin, 0),
+            FreeCAD.Vector(self.bb.XMin, self.bb.YMax, 0),
+            FreeCAD.Vector(self.bb.XMax, self.bb.YMax, 0),
+        ]
+        perp = self.tilt_axis  # perpendicular to rib in XY = stacking direction
+        proj = [c.dot(perp) for c in corners]
+        center_proj = self.center.dot(perp)
+        span = max(proj) - min(proj)
+        num = int(span / self.p.rib_spacing) + 3
+
+        slabs = []
+        for i in range(-num, num + 1):
+            slab = self._build_one_slab(i)
+            clipped = slab.common(self.shape)
+            if clipped.isNull():
+                continue
+            if clipped.ShapeType == "Compound":
+                solids = clipped.Solids
+                if not solids:
+                    continue
+                clipped = Part.makeCompound(solids)
+            slabs.append(clipped)
+
+        if not slabs:
+            return Part.makeCompound([])
+        return Part.makeCompound(slabs)
+
+    def _build_one_slab(self, index: int) -> Part.Shape:
+        """
+        Build one lightened slab in canonical frame, then orient it.
+
+        Canonical frame: slab along X, cross-section in Y*Z, centered at origin.
+        Stacking offset is applied along the perpendicular (tilt_axis) direction.
+        """
+        w      = self.p.rib_width
+        length = self.diag_3d * 2   # oversized — clipped later
+
+        # ---- 1. Canonical slab box ----
+        slab = Part.makeBox(
+            length, w, self.zlen * 2,
+            FreeCAD.Vector(-length / 2, -w / 2, -self.zlen),
+        )
+
+        # ---- 2. Cut periodic elliptical holes in canonical frame ----
+        if (self.p.semi_minor >= self.p.min_hole_size or
+                self.p.semi_major >= self.p.min_hole_size):
+            holes = self._build_hole_strip(length)
+            if is_valid(holes):
+                slab = slab.cut(holes)
+
+        # ---- 3. Rotate in XY to align with family direction ----
+        slab.rotate(
+            FreeCAD.Vector(0, 0, 0),
+            FreeCAD.Vector(0, 0, 1),
+            self.orientation_deg,
+        )
+
+        # ---- 4. Tilt around the rib axis ----
+        if self.tilt_deg != 0.0:
+            slab.rotate(
+                FreeCAD.Vector(0, 0, 0),
+                self.tilt_axis,
+                self.tilt_deg,
+            )
+
+        # ---- 5. Translate: stack offset along tilt_axis + shape center ----
+        offset_vec = FreeCAD.Vector(
+            self.tilt_axis.x * index * self.p.rib_spacing + self.center.x,
+            self.tilt_axis.y * index * self.p.rib_spacing + self.center.y,
+            self.center.z,
+        )
+        slab.translate(offset_vec)
+
+        return slab
+
+    def _build_hole_strip(self, length: float) -> Part.Shape:
+        """
+        Periodic elliptical cylinders along X in the canonical frame.
+        One hole per rib_spacing period, extruded in Z to fully penetrate.
+        """
+        rx = self.p.semi_major
+        ry = self.p.semi_minor
+        s  = self.p.rib_spacing
+        z_depth = self.zlen * 2 + 2.0
+
+        num_holes = int(length / s) + 2
+        holes = []
+
+        for k in range(-num_holes, num_holes + 1):
+            cx = k * s
+            ellipse = Part.Ellipse(FreeCAD.Vector(0, 0, 0), rx, ry)
+            wire = Part.Wire(ellipse.toShape())
+            face = Part.Face(wire)
+            face.translate(FreeCAD.Vector(cx, 0, -z_depth / 2))
+            cyl = face.extrude(FreeCAD.Vector(0, 0, z_depth))
+            holes.append(cyl)
+
+        if not holes:
+            return Part.makeCompound([])
+        return Part.makeCompound(holes)
 
 
 # ============================================================
-# MAIN GENERATION (without split)
+# MAIN GENERATOR
 # ============================================================
-def generate_lw_infill(body, params, doc=None):
+
+def generate_lw_infill(shape, params: LWInfillParams, doc=None):
+    """
+    Generate a two-family tilted slab lattice with elliptical lightening,
+    clipped to `shape`, and add the result to `doc`.
+    """
     if doc is None:
         doc = FreeCAD.ActiveDocument
 
-    # 1. Face selection
-    work_face = find_bottom_face(body)
-    if not work_face:
-        raise ValueError("No valid face found on the body.")
-    face_normal = work_face.normalAt(0.5, 0.5)
+    params.validate()
 
-    # 2. Create two families of grid lines
-    print(f"Generating grid lines on face (area={work_face.Area:.1f} mm²)...")
-    lines1, lines2 = create_angled_grid_lines(work_face, params.rib_spacing, params.rib_angle)
-    print(f"  Family1 lines: {len(lines1)}, Family2 lines: {len(lines2)}")
+    raw_shape = shape.Shape if hasattr(shape, "Shape") else shape
+    bb = raw_shape.BoundBox
 
-    # 3. Convert lines to rib faces
-    rib_faces1 = create_rib_faces(lines1, face_normal, params.rib_width)
-    rib_faces2 = create_rib_faces(lines2, face_normal, params.rib_width)
-    print(f"  Rib faces: {len(rib_faces1)} + {len(rib_faces2)}")
+    # Compute family directions
+    dir1, dir2 = compute_family_directions(bb, params)
+    print(f"Family 1 direction: ({dir1.x:.3f}, {dir1.y:.3f})")
+    print(f"Family 2 direction: ({dir2.x:.3f}, {dir2.y:.3f})")
 
-    if not rib_faces1 and not rib_faces2:
-        raise ValueError("No rib faces generated.")
+    # Build each family
+    print("Generating family 1...")
+    fam1 = SlabFamily(raw_shape, params, dir1, +params.tilt_deg)
+    ribs1 = fam1.build()
+    print(f"  {len(ribs1.Solids) if is_valid(ribs1) else 0} slab segments")
 
-    bbox = body.BoundBox
-    z_extent = bbox.ZMax - bbox.ZMin
-    extrude_dist = z_extent * 2.0
-    extrude_dir = FreeCAD.Vector(0, 0, 1)
+    print("Generating family 2...")
+    fam2 = SlabFamily(raw_shape, params, dir2, -params.tilt_deg)
+    ribs2 = fam2.build()
+    print(f"  {len(ribs2.Solids) if is_valid(ribs2) else 0} slab segments")
 
-    # Helper: extrude a list of faces
-    def extrude_faces(faces):
-        solids = []
-        for face in faces:
-            try:
-                rib = face.extrude(extrude_dir * extrude_dist)
-                rib.translate(FreeCAD.Vector(0, 0, bbox.ZMin - z_extent * 0.5))
-                solids.append(rib)
-            except Exception:
-                pass
-        return solids
+    # Combine — use makeCompound to avoid expensive boolean fuse
+    parts = [s for s in [ribs1, ribs2] if is_valid(s)]
+    if not parts:
+        raise ValueError("No rib geometry produced.")
 
-    solids1 = extrude_faces(rib_faces1)
-    solids2 = extrude_faces(rib_faces2)
+    final = Part.makeCompound(parts)
 
-    # Helper: fuse a list of solids
-    def fuse_solids(solids):
-        if not solids:
-            return None
-        fused = solids[0]
-        for s in solids[1:]:
-            try:
-                fused = fused.fuse(s)
-            except Exception:
-                pass
-        return fused
+    obj = doc.addObject("Part::Feature", "LWInfill")
+    obj.Shape = final
+    doc.recompute()
+    print("Done.")
+    return obj
 
-    fused1 = fuse_solids(solids1)
-    fused2 = fuse_solids(solids2)
-
-    # Combine the two families (no extra tilt needed – the ribs are already at ±rib_angle)
-    rib_parts = [p for p in [fused1, fused2] if p is not None]
-    if not rib_parts:
-        raise ValueError("No rib solids to cut with.")
-    fused_ribs = rib_parts[0]
-    for p in rib_parts[1:]:
-        try:
-            fused_ribs = fused_ribs.fuse(p)
-        except Exception:
-            pass
-
-    print("Cutting internal structure...")
-    result = body
-    try:
-        result = body.cut(fused_ribs)
-    except Exception as e:
-        print(f"Cut failed: {e}")
-    return result
-
-    def tilt_ribs(ribs, angle):
-        if angle == 0.0 or ribs is None:
-            return ribs
-        rot_mat = FreeCAD.Matrix()
-        rot_mat.rotateY(angle)
-        T_to_origin = FreeCAD.Matrix()
-        T_to_origin.move(-rot_center)
-        T_back = FreeCAD.Matrix()
-        T_back.move(rot_center)
-        final_mat = T_back * rot_mat * T_to_origin
-        return ribs.transformGeometry(final_mat)
-
-    if tilt != 0.0:
-        print(f"Tilting ribs: ±{params.tilt_angle:.1f}°")
-    fused1 = tilt_ribs(fused1, tilt)   # +angle
-    fused2 = tilt_ribs(fused2, -tilt)  # -angle
-
-    # Combine both families
-    rib_parts = [p for p in [fused1, fused2] if p is not None]
-    if not rib_parts:
-        raise ValueError("No rib solids to cut with.")
-    fused_ribs = rib_parts[0]
-    for p in rib_parts[1:]:
-        try:
-            fused_ribs = fused_ribs.fuse(p)
-        except Exception:
-            pass
-
-    # Cut
-    print("Cutting internal structure...")
-    result = body
-    try:
-        result = body.cut(fused_ribs)
-    except Exception as e:
-        print(f"Cut failed: {e}")
-    return result
 
 # ============================================================
-# EXAMPLE USAGE
+# DIAGNOSTICS
 # ============================================================
+
+def see_objects(doc):
+    for o in doc.Objects:
+        print(o.Name, "|", o.Label, "|", o.TypeId)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
 if __name__ == "__main__":
-    # Open your wing file
-    doc_path = r"C:\Users\natha\git\ContinuousPath\wing.FCStd"
-    doc = FreeCAD.open(doc_path)
 
-    # Get the wing body (assuming the Pad object is the solid)
-    wing = doc.getObject("Pad")
-    if not wing:
-        raise RuntimeError("Object 'Pad' not found in document.")
-
-    # Set parameters
     params = LWInfillParams(
-        nozzle_diameter = 0.4,
-        rib_spacing     = 10.0,
-        rib_width       = 0.1,
-        rib_angle       = 30.0   # +30° and -30° from span
+        nozzle_diameter  = 0.4,
+        rib_spacing      = 20.0,
+        rib_width        = 3.0,
+        rib_angle        = 30.0,    # ±30° from primary direction
+        tilt_deg         = 30.0,    # tilt makes crossing vector horizontal
+        grid_orientation = 0.0,
+        primary_dir      = None,    # auto-detect from bounding box
+        hole_margin      = 0.5,
+        min_hole_size    = 4.0,
     )
 
-    # Generate the infill (no chord curves yet)
-    result_body = generate_lw_infill(wing.Shape, params, doc)
+    doc_path = r"C:\Users\natha\git\ContinuousPath\wing.FCStd"
+    doc = FreeCAD.open(doc_path)
+    see_objects(doc)
 
-    # Add result to document
-    obj = doc.addObject("Part::Feature", "WingWithInfill")
-    obj.Shape = result_body
+    wing = doc.getObject("Pad")
+    generate_lw_infill(wing, params, doc)
+
     doc.recompute()
-    print("Lightweight wing created successfully.")
-    
