@@ -72,7 +72,7 @@ if __name__ == "__main__":
     )
 
     show_points_per_rib(points_by_rib, doc, mode='mid', prefix="RibMidpoints")
-    show_points_per_rib(points_by_rib, doc, mode='edge_cases', prefix="RibEdgeCases")
+    # show_points_per_rib(points_by_rib, doc, mode='edge_cases', prefix="RibEdgeCases")
 
     # Combine all points for a global view
     all_points = []

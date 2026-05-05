@@ -189,29 +189,56 @@ def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, 
     return unified
 
 def create_cut_result(body, params, doc=None):
-    """Returns (cut_shape, rib_center_lines, list_of_individual_rib_solids)"""
+    """Returns (cut_shape, rib_center_lines, list_of_valid_rib_solids)"""
     if doc is None:
         doc = FreeCAD.ActiveDocument
     raw_shape = body.Shape if hasattr(body, "Shape") else body
     bb = raw_shape.BoundBox
+
     lines1, lines2 = create_angled_grid_lines(bb, params)
     all_center_lines = lines1 + lines2
+
     rib_faces1 = create_rib_faces(lines1, params.plane_normal, params.rib_width)
     rib_faces2 = create_rib_faces(lines2, params.plane_normal, params.rib_width)
+
     rib_solids1 = extrude_rib_faces_to_solids(rib_faces1, params.plane_normal, bb)
     rib_solids2 = extrude_rib_faces_to_solids(rib_faces2, params.plane_normal, bb)
     all_rib_solids = rib_solids1 + rib_solids2
-    # fuse ribs for cutting
+
+    # ------------------------------------------------------------
+    # FILTER: keep only ribs that significantly intersect the wing
+    # ------------------------------------------------------------
+    valid_ribs = []
+    for rib in all_rib_solids:
+        try:
+            # Intersect the rib solid with the wing
+            common = rib.common(raw_shape)
+            # If the common shape has volume less than 1 mm³, discard it
+            if common is None or common.Volume < 1.0:
+                continue
+            valid_ribs.append(rib)
+        except Exception:
+            continue
+
+    if not valid_ribs:
+        raise ValueError("No rib solids significantly intersect the wing.")
+
+    # Fuse the valid ribs for cutting
     def fuse_list(lst):
         if not lst:
             return None
         f = lst[0]
         for s in lst[1:]:
-            f = f.fuse(s)
+            try:
+                f = f.fuse(s)
+            except Exception:
+                pass
         return f
-    fused_ribs = fuse_list(all_rib_solids)
+
+    fused_ribs = fuse_list(valid_ribs)
     cut_result = raw_shape.cut(fused_ribs)
-    return cut_result, all_center_lines, all_rib_solids
+
+    return cut_result, all_center_lines, valid_ribs
 
 def generate_final_solid(body, params, doc=None, add_bridges=True):
     """Returns the final solid (cut + bridges)"""
