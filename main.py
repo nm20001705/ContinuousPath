@@ -65,36 +65,24 @@ if __name__ == "__main__":
     points_by_rib = collect_rib_midpoints(
         wing_shape=wing.Shape,
         rib_center_lines=all_center_lines,
-        plane_normal=params.plane_normal,   # e.g., Vector(0,1,0) for XZ plane
+        plane_normal=params.plane_normal,
         z_min=bb.ZMin + 0.5,
         z_max=bb.ZMax - 0.5,
-        z_step=z_step
+        z_step=z_step,
     )
 
-    # 4. Visualise points per rib (if any)
-    total_points = sum(len(pts) for pts in points_by_rib.values())
-    print(f"Total midpoints collected: {total_points}")
-    show_points_per_rib(points_by_rib, doc)
-    if total_points > 0:
-        show_points_per_rib(points_by_rib, doc)
-    else:
-        print("No midpoints were collected. Check rib solids and slice range.")
+    show_points_per_rib(points_by_rib, doc, mode='mid', prefix="RibMidpoints")
+    show_points_per_rib(points_by_rib, doc, mode='edge_cases', prefix="RibEdgeCases")
 
-    # --- Also create a single point cloud with all points (regardless of grouping) ---
+    # Combine all points for a global view
     all_points = []
-    for pts in points_by_rib.values():
-        all_points.extend(pts)
+    for data in points_by_rib.values():
+        all_points.extend(data['mid'])
+        all_points.extend(data['edge_cases'])
     if all_points:
         vertices = [Part.Vertex(p) for p in all_points]
-        all_points_compound = Part.Compound(vertices)
-        all_pts_obj = doc.addObject("Part::Feature", "AllMidpoints")
-        all_pts_obj.Shape = all_points_compound
-        show_points_per_rib(points_by_rib, doc)
+        compound = Part.Compound(vertices)
+        obj = doc.addObject("Part::Feature", "AllPoints")
+        obj.Shape = compound
         doc.recompute()
-        print(f"Added 'AllMidpoints' with {len(all_points)} points.")
-    else:
-        print("No points to display in 'AllMidpoints'.")
-
-    # 5. (Optional) Generate final solid with bridges
-    final_solid = generate_final_solid(wing.Shape, params, doc, add_bridges=True)
-    print("Lightweight wing with bridges created.")
+        print(f"Added 'AllPoints' with {len(all_points)} points.")
