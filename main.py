@@ -3,7 +3,9 @@ import FreeCAD
 import FreeCADGui
 import Part
 from slab_utils import LWInfillParams, create_cut_result, generate_final_solid
-from point_utils import collect_midpoints_from_wing_and_ribs, show_points_per_rib
+from point_utils import collect_rib_midpoints, show_points_per_rib
+
+
 
 if __name__ == "__main__":
     doc_path = r"C:\Users\natha\git\ContinuousPath\wing.FCStd"
@@ -58,16 +60,23 @@ if __name__ == "__main__":
     bb = wing.Shape.BoundBox
     z_min = bb.ZMin + 0.5
     z_max = bb.ZMax - 0.5
-    z_step = 1.5
+    z_step = 10
     print(f"Collecting midpoints from z={z_min:.1f} to {z_max:.1f}, step={z_step:.1f}...")
-    points_by_rib = collect_midpoints_from_wing_and_ribs(wing.Shape, all_rib_solids,
-                                                         z_min, z_max, z_step)
+    points_by_rib = collect_rib_midpoints(
+        wing_shape=wing.Shape,
+        rib_center_lines=all_center_lines,
+        plane_normal=params.plane_normal,   # e.g., Vector(0,1,0) for XZ plane
+        z_min=bb.ZMin + 0.5,
+        z_max=bb.ZMax - 0.5,
+        z_step=z_step
+    )
 
     # 4. Visualise points per rib (if any)
     total_points = sum(len(pts) for pts in points_by_rib.values())
     print(f"Total midpoints collected: {total_points}")
+    show_points_per_rib(points_by_rib, doc)
     if total_points > 0:
-        show_points_per_rib(points_by_rib, doc, prefix="RibSegmentMidpoints")
+        show_points_per_rib(points_by_rib, doc)
     else:
         print("No midpoints were collected. Check rib solids and slice range.")
 
@@ -80,6 +89,7 @@ if __name__ == "__main__":
         all_points_compound = Part.Compound(vertices)
         all_pts_obj = doc.addObject("Part::Feature", "AllMidpoints")
         all_pts_obj.Shape = all_points_compound
+        show_points_per_rib(points_by_rib, doc)
         doc.recompute()
         print(f"Added 'AllMidpoints' with {len(all_points)} points.")
     else:
