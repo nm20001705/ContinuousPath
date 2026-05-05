@@ -306,3 +306,37 @@ def show_points_per_rib(data_by_rib, doc, mode='mid', prefix='RibPoints'):
     doc.recompute()
     total = sum(len(data['mid']) if mode=='mid' else len(data['edge_cases']) if mode=='edge_cases' else len(data['mid'])+len(data['edge_cases']) for data in data_by_rib.values())
     print(f"Visualized {count} ribs with {total} points (mode={mode}).")
+
+def create_rib_wires(data_by_rib, doc):
+    """
+    Create a wire (polyline) for each rib by connecting its midpoints
+    in order of increasing Z. Returns a compound of all wires.
+    """
+    wires = []
+    for idx, data in data_by_rib.items():
+        pts = data['mid']
+        if len(pts) < 2:
+            continue
+        # Sort points by Z (lowest to highest)
+        pts_sorted = sorted(pts, key=lambda p: p.z)
+        # Build edges between consecutive points
+        edges = []
+        for i in range(len(pts_sorted)-1):
+            edges.append(Part.makeLine(pts_sorted[i], pts_sorted[i+1]))
+        if edges:
+            if len(edges) == 1:
+                wire = Part.Wire(edges[0])
+            else:
+                wire = Part.Wire(edges)
+            wires.append(wire)
+    if wires:
+        compound = Part.Compound(wires)
+        obj = doc.addObject("Part::Feature", "RibWires")
+        obj.Shape = compound
+        if FreeCAD.GuiUp:
+            obj.ViewObject.LineColor = (0.0, 1.0, 0.0)  # green
+            obj.ViewObject.LineWidth = 2
+        doc.recompute()
+        print(f"Created {len(wires)} rib wires (total edges = {sum(len(w.Edges) for w in wires)}).")
+    else:
+        print("No wires created (need at least 2 points per rib).")

@@ -3,7 +3,7 @@ import FreeCAD
 import FreeCADGui
 import Part
 from slab_utils import LWInfillParams, create_cut_result, generate_final_solid
-from point_utils import collect_rib_midpoints, show_points_per_rib
+from point_utils import collect_rib_midpoints, show_points_per_rib, create_rib_wires
 
 
 
@@ -71,9 +71,9 @@ if __name__ == "__main__":
         z_step=z_step,
     )
 
-    show_points_per_rib(points_by_rib, doc, mode='mid', prefix="RibMidpoints")
+    # show_points_per_rib(points_by_rib, doc, mode='mid', prefix="RibMidpoints")
     # show_points_per_rib(points_by_rib, doc, mode='edge_cases', prefix="RibEdgeCases")
-
+    create_rib_wires(points_by_rib, doc)
     # Combine all points for a global view
     all_points = []
     for data in points_by_rib.values():
