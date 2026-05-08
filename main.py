@@ -16,13 +16,13 @@ if __name__ == "__main__":
     doc_path = r"C:\Users\natha\git\ContinuousPath\wing.FCStd"
     doc = FreeCAD.open(doc_path)
 
-    wing = doc.getObject("Pocket")
+    wing = doc.getObject("Pad")
     if not wing:
         raise RuntimeError("Object 'Pad' not found in document.")
 
     params = LWInfillParams(
         nozzle_diameter  = 0.4,
-        rib_spacing      = 70.0,
+        rib_spacing      = 20.0,
         rib_width        = 0.1,
         rib_angle        = 30.0,
         grid_orientation = 0.0,
@@ -36,8 +36,8 @@ if __name__ == "__main__":
 
     # --- Visualise cut wing (semi‑transparent) ---
     cut_obj = doc.addObject("Part::Feature", "CutWing")
-    cut_obj.Shape = cut_result
-    doc.recompute()
+    # cut_obj.Shape = cut_result
+    # doc.recompute()
     if FreeCAD.GuiUp:
         vp = FreeCADGui.ActiveDocument.getObject(cut_obj.Name)
         if vp:
@@ -48,12 +48,12 @@ if __name__ == "__main__":
 
     # --- Visualise original rib centre lines (red) ---
     rib_lines_compound = Part.Compound([line for line in all_center_lines])
-    obj_lines = doc.addObject("Part::Feature", "RibCentreLines")
-    obj_lines.Shape = rib_lines_compound
-    if FreeCAD.GuiUp:
-        line_view = FreeCADGui.ActiveDocument.getObject(obj_lines.Name)
-        if line_view:
-            line_view.LineColor = (1.0, 0.0, 0.0)
+    # obj_lines = doc.addObject("Part::Feature", "RibCentreLines")
+    # obj_lines.Shape = rib_lines_compound
+    # if FreeCAD.GuiUp:
+    #     line_view = FreeCADGui.ActiveDocument.getObject(obj_lines.Name)
+    #     if line_view:
+    #         line_view.LineColor = (1.0, 0.0, 0.0)
     doc.recompute()
     print(f"Visualized {len(all_center_lines)} rib centre lines.")
 
@@ -84,8 +84,8 @@ if __name__ == "__main__":
         vertices = [Part.Vertex(p) for p in all_points]
         compound = Part.Compound(vertices)
         obj = doc.addObject("Part::Feature", "AllPoints")
-        obj.Shape = compound
-        doc.recompute()
+        # obj.Shape = compound
+        # doc.recompute()
         print(f"Added 'AllPoints' with {len(all_points)} points.")
 
     # 5. Create trimmed bridges (one bridge per rib piece)
@@ -94,7 +94,7 @@ if __name__ == "__main__":
         rib_center_lines=all_center_lines,
         plane_normal=params.plane_normal,
         rib_width=params.rib_width,
-        bridge_height=0.5,
+        bridge_height=0.50,
         wing_shape=wing.Shape,
         extend_length=5.0,
         doc=doc

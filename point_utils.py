@@ -174,44 +174,114 @@ def _clip_line_to_wing_wires(point_on_line, line_dir, wires, max_len=2000.0):
 # ------------------------------------------------------------
 def collect_rib_midpoints(wing_shape, rib_center_lines, plane_normal, z_min, z_max, z_step):
     from collections import defaultdict
-    segments_per_rib = defaultdict(list)  # rib_idx -> list of (z, p1, p2, mid, seg_idx)
-    max_len = math.sqrt(wing_shape.BoundBox.XLength**2 + wing_shape.BoundBox.YLength**2) * 2
+    try:
+        segments_per_rib = defaultdict(list)
+        max_len = math.sqrt(wing_shape.BoundBox.XLength**2 + wing_shape.BoundBox.YLength**2) * 2
 
-    z = z_min
-    slice_count = 0
-    while z <= z_max + 1e-6:
-        wires = _get_wing_wires_at_z(wing_shape, z)
-        if wires:
-            for idx, line in enumerate(rib_center_lines):
-                res = _rib_plane_intersect_z_plane(line, plane_normal, z)
-                if res is None:
-                    continue
-                p0, d = res
-                seg_list = _clip_line_to_wing_wires(p0, d, wires, max_len)
-                for i_seg, (p1, p2, mid) in enumerate(seg_list):
-                    segments_per_rib[idx].append((z, p1, p2, mid, i_seg))
-        z += z_step
-        slice_count += 1
+        # 1) Regular horizontal sampling
+        z = z_min
+        slice_count = 0
+        while z <= z_max + 1e-6:
+            wires = _get_wing_wires_at_z(wing_shape, z)
+            if wires:
+                for idx, line in enumerate(rib_center_lines):
+                    res = _rib_plane_intersect_z_plane(line, plane_normal, z)
+                    if res is None:
+                        continue
+                    p0, d = res
+                    seg_list = _clip_line_to_wing_wires(p0, d, wires, max_len)
+                    for i_seg, (p1, p2, mid) in enumerate(seg_list):
+                        segments_per_rib[idx].append((z, p1, p2, mid, i_seg))
+            z += z_step
+            slice_count += 1
 
-    # Group by rib and by segment index to form continuous pieces
-    data_by_rib = {}
-    for idx, entries in segments_per_rib.items():
-        entries.sort(key=lambda x: x[0])  # sort by z
-        # Group by segment index
-        piece_dict = defaultdict(list)
-        for z, p1, p2, mid, i_seg in entries:
-            piece_dict[i_seg].append((z, mid))
-        pieces = []
-        for pts in piece_dict.values():
-            pts_sorted = sorted(pts, key=lambda x: x[0])
-            midpoints = [p for (_, p) in pts_sorted]
-            if midpoints:
-                pieces.append(midpoints)
-        data_by_rib[idx] = pieces
+        # 2) Edge-case points from plane‑wing intersection
+        edge_pts_per_rib = {}
+        for idx, line in enumerate(rib_center_lines):
+            start = line.Vertexes[0].Point
+            end = line.Vertexes[-1].Point
+            d = (end - start).normalize()
+            n_rib = d.cross(plane_normal).normalize()
+            plane = Part.Plane(start, n_rib)
+            try:
+                intersection = wing_shape.section(plane)
+                if intersection and intersection.Edges:
+                    vertices = []
+                    for edge in intersection.Edges:
+                        vertices.append(edge.Vertexes[0].Point)
+                        vertices.append(edge.Vertexes[-1].Point)
+                    if vertices:
+                        min_z = min(p.z for p in vertices)
+                        max_z = max(p.z for p in vertices)
+                        z_tol = 1e-4
+                        low_pts = [p for p in vertices if abs(p.z - min_z) <= z_tol]
+                        high_pts = [p for p in vertices if abs(p.z - max_z) <= z_tol]
+                        edge_pts = []
+                        if low_pts:
+                            c = FreeCAD.Vector(0,0,0)
+                            for p in low_pts: c += p
+                            edge_pts.append(c / len(low_pts))
+                        if high_pts:
+                            c = FreeCAD.Vector(0,0,0)
+                            for p in high_pts: c += p
+                            edge_pts.append(c / len(high_pts))
+                        edge_pts_per_rib[idx] = edge_pts
+            except Exception:
+                pass
 
-    total_pieces = sum(len(v) for v in data_by_rib.values())
-    print(f"Collected {total_pieces} rib pieces (disconnected segments) over {slice_count} slices.")
-    return data_by_rib
+        # 3) Group segments into pieces and add edge-case points
+        data_by_rib = {}
+        for idx, entries in segments_per_rib.items():
+            entries.sort(key=lambda x: x[0])   # by Z
+            # group by segment index
+            piece_dict = defaultdict(list)
+            for z, p1, p2, mid, i_seg in entries:
+                piece_dict[i_seg].append((z, mid))
+            piece_data = []
+            for piece_pts in piece_dict.values():
+                pts_sorted = sorted(piece_pts, key=lambda x: x[0])
+                midpoints = [p for (_, p) in pts_sorted]
+                if midpoints:
+                    zmin = min(p.z for p in midpoints)
+                    zmax = max(p.z for p in midpoints)
+                    piece_data.append((midpoints, zmin, zmax))
+            # assign edge points to the correct piece
+            if idx in edge_pts_per_rib:
+                for ep in edge_pts_per_rib[idx]:
+                    best_i = None
+                    best_dist = float('inf')
+                    for i, (_, zmin, zmax) in enumerate(piece_data):
+                        if zmin - 1e-4 <= ep.z <= zmax + 1e-4:
+                            best_i = i
+                            break
+                        dist = min(abs(ep.z - zmin), abs(ep.z - zmax))
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_i = i
+                    if best_i is not None:
+                        midpoints, _, _ = piece_data[best_i]
+                        if not any(ep.isEqual(m, 1e-3) for m in midpoints):
+                            midpoints.append(ep)
+            # sort and deduplicate each piece
+            pieces = []
+            for midpoints, _, _ in piece_data:
+                midpoints.sort(key=lambda p: p.z)
+                uniq = []
+                for p in midpoints:
+                    if not uniq or not p.isEqual(uniq[-1], 1e-3):
+                        uniq.append(p)
+                pieces.append(uniq)
+            if pieces:
+                data_by_rib[idx] = pieces
+
+        total_pieces = sum(len(v) for v in data_by_rib.values())
+        print(f"Collected {total_pieces} rib pieces (including edge cases) over {slice_count} slices.")
+        return data_by_rib if data_by_rib else {}
+    except Exception as e:
+        print(f"Fatal error in collect_rib_midpoints: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
 # ------------------------------------------------------------
 # VISUALISATION
 # ------------------------------------------------------------
