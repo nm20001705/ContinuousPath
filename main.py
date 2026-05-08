@@ -95,8 +95,21 @@ if __name__ == "__main__":
         rib_center_lines=all_center_lines,
         plane_normal=params.plane_normal,
         rib_width=params.rib_width,
-        bridge_height=0.5,          # adjust as needed (small)
-        wing_shape=wing.Shape,      # the original solid to trim the bridges
-        extend_length=5.0,          # mm extension beyond the wire endpoints
+        bridge_height=0.5,
+        wing_shape=wing.Shape,
+        extend_length=5.0,
         doc=doc
     )
+
+    # 5. Merge cut wing with bridges to create a single solid
+    if bridges:
+        final_solid = cut_result.fuse(bridges.Shape)
+        final_obj = doc.addObject("Part::Feature", "WingWithBridges")
+        final_obj.Shape = final_solid
+        if FreeCAD.GuiUp:
+            final_obj.ViewObject.ShapeColor = (0.8, 0.8, 0.8)
+            final_obj.ViewObject.Transparency = 0
+        doc.recompute()
+        print("Final solid (wing + bridges) created successfully.")
+    else:
+        print("No bridges created – cannot merge.")
