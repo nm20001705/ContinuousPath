@@ -22,7 +22,7 @@ if __name__ == "__main__":
 
     params = LWInfillParams(
         nozzle_diameter  = 0.4,
-        rib_spacing      = 20.0,
+        rib_spacing      = 60.0,
         rib_width        = 0.1,
         rib_angle        = 30.0,
         grid_orientation = 0.0,
@@ -61,7 +61,7 @@ if __name__ == "__main__":
     bb = wing.Shape.BoundBox
     z_min = bb.ZMin + 0.5
     z_max = bb.ZMax - 0.5
-    z_step = 10.0
+    z_step = 5.0
     print(f"Collecting midpoints from z={z_min:.1f} to {z_max:.1f}, step={z_step:.1f}...")
     pieces_by_rib = collect_rib_midpoints(
         wing_shape=wing.Shape,
