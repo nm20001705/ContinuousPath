@@ -3,7 +3,9 @@ import FreeCAD
 import FreeCADGui
 import Part
 from slab_utils import LWInfillParams, create_cut_result, generate_final_solid
-from point_utils import collect_rib_midpoints, show_points_per_rib, create_rib_surfaces
+from point_utils import collect_rib_midpoints, show_points_per_rib, create_rib_wires
+from prism_utils import create_rectangular_prism_bridge
+
 
 
 
@@ -69,21 +71,16 @@ if __name__ == "__main__":
         z_min=bb.ZMin + 0.5,
         z_max=bb.ZMax - 0.5,
         z_step=z_step,
-        rib_width=params.rib_width,
     )
-
-    show_points_per_rib(points_by_rib, doc, mode='both', prefix="RibPoints")
-    create_rib_surfaces(points_by_rib, doc)
 
     # show_points_per_rib(points_by_rib, doc, mode='mid', prefix="RibMidpoints")
     # show_points_per_rib(points_by_rib, doc, mode='edge_cases', prefix="RibEdgeCases")
-    # create_rib_wires(points_by_rib, doc)
-    # create_rib_surfaces_from_wires(points_by_rib, all_center_lines, params.plane_normal, params.rib_width, doc)
+    create_rib_wires(points_by_rib, doc)
     # Combine all points for a global view
     all_points = []
     for data in points_by_rib.values():
-        all_points.extend(data['face_a'])
-        all_points.extend(data['face_b'])
+        all_points.extend(data['mid'])
+        all_points.extend(data['edge_cases'])
     if all_points:
         vertices = [Part.Vertex(p) for p in all_points]
         compound = Part.Compound(vertices)
@@ -91,3 +88,13 @@ if __name__ == "__main__":
         obj.Shape = compound
         doc.recompute()
         print(f"Added 'AllPoints' with {len(all_points)} points.")
+
+
+    create_rectangular_prism_bridge(
+        data_by_rib=points_by_rib,
+        rib_center_lines=all_center_lines,
+        plane_normal=params.plane_normal,
+        rib_width=params.rib_width,
+        bridge_height=0.5,          # small height, adjust as needed
+        doc=doc
+    )
