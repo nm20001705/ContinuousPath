@@ -114,8 +114,12 @@ def _rib_plane_intersect_z_plane(rib_center_line, plane_normal, z):
 # clip line to wing cross‑section → segment (for interior points)
 # ------------------------------------------------------------
 def _clip_line_to_wing_wires(point_on_line, line_dir, wires, max_len=2000.0):
+    """
+    Return a list of tuples (p1, p2, mid) for all inside segments
+    where the line passes through the wing cross-section.
+    """
     if not wires:
-        return None
+        return []
     p = point_on_line
     d = line_dir
     seg_start = FreeCAD.Vector(p.x - d.x*max_len, p.y - d.y*max_len, p.z)
@@ -123,7 +127,8 @@ def _clip_line_to_wing_wires(point_on_line, line_dir, wires, max_len=2000.0):
     try:
         test_edge = Part.makeLine(seg_start, seg_end)
     except Exception:
-        return None
+        return []
+
     t_vals = []
     for wire in wires:
         for edge in wire.Edges:
@@ -137,41 +142,41 @@ def _clip_line_to_wing_wires(point_on_line, line_dir, wires, max_len=2000.0):
             except Exception:
                 continue
     if len(t_vals) < 2:
-        return None
+        return []
     t_vals.sort()
-    best = None
-    best_len = 0.0
+    segments = []
     for k in range(len(t_vals)-1):
-        t_mid = (t_vals[k] + t_vals[k+1]) / 2.0
+        t1 = t_vals[k]
+        t2 = t_vals[k+1]
+        if abs(t2-t1) < 1e-6:
+            continue
+        t_mid = (t1+t2)/2.0
         mid_pt = FreeCAD.Vector(p.x + d.x*t_mid, p.y + d.y*t_mid, p.z)
         inside = False
         for wire in wires:
             try:
                 face = Part.Face(wire)
                 inside = face.isInside(mid_pt, 1e-3, True)
-            except Exception:
+                if inside: break
+            except:
                 inside = wire.BoundBox.isInside(mid_pt)
-            if inside:
-                break
+                if inside: break
         if inside:
-            seg_len = t_vals[k+1] - t_vals[k]
-            if seg_len > best_len:
-                best_len = seg_len
-                p1 = FreeCAD.Vector(p.x + d.x*t_vals[k], p.y + d.y*t_vals[k], p.z)
-                p2 = FreeCAD.Vector(p.x + d.x*t_vals[k+1], p.y + d.y*t_vals[k+1], p.z)
-                mid = FreeCAD.Vector((p1.x+p2.x)/2, (p1.y+p2.y)/2, p.z)
-                best = (p1, p2, mid)
-    return best
+            p1 = FreeCAD.Vector(p.x + d.x*t1, p.y + d.y*t1, p.z)
+            p2 = FreeCAD.Vector(p.x + d.x*t2, p.y + d.y*t2, p.z)
+            mid = (p1 + p2) * 0.5
+            segments.append((p1, p2, mid))
+    return segments
 
 
 # ------------------------------------------------------------
 # MAIN COLLECTION (corrected edge‑case detection)
 # ------------------------------------------------------------
 def collect_rib_midpoints(wing_shape, rib_center_lines, plane_normal, z_min, z_max, z_step):
-    data_by_rib = defaultdict(lambda: {'mid': [], 'edge_cases': []})
+    from collections import defaultdict
+    segments_per_rib = defaultdict(list)  # rib_idx -> list of (z, p1, p2, mid, seg_idx)
     max_len = math.sqrt(wing_shape.BoundBox.XLength**2 + wing_shape.BoundBox.YLength**2) * 2
 
-    # 1) Regular horizontal sampling – collect midpoints (interior points)
     z = z_min
     slice_count = 0
     while z <= z_max + 1e-6:
@@ -182,102 +187,30 @@ def collect_rib_midpoints(wing_shape, rib_center_lines, plane_normal, z_min, z_m
                 if res is None:
                     continue
                 p0, d = res
-                seg = _clip_line_to_wing_wires(p0, d, wires, max_len)
-                if seg is None:
-                    continue
-                _, _, mid = seg
-                data_by_rib[idx]['mid'].append(mid)
+                seg_list = _clip_line_to_wing_wires(p0, d, wires, max_len)
+                for i_seg, (p1, p2, mid) in enumerate(seg_list):
+                    segments_per_rib[idx].append((z, p1, p2, mid, i_seg))
         z += z_step
         slice_count += 1
 
-    # 2) Edge‑case points from plane‑wing intersection
-    for idx, line in enumerate(rib_center_lines):
-        start = line.Vertexes[0].Point
-        end   = line.Vertexes[-1].Point
-        d = (end - start).normalize()
-        n_rib = d.cross(plane_normal).normalize()
-        plane = Part.Plane(start, n_rib)
+    # Group by rib and by segment index to form continuous pieces
+    data_by_rib = {}
+    for idx, entries in segments_per_rib.items():
+        entries.sort(key=lambda x: x[0])  # sort by z
+        # Group by segment index
+        piece_dict = defaultdict(list)
+        for z, p1, p2, mid, i_seg in entries:
+            piece_dict[i_seg].append((z, mid))
+        pieces = []
+        for pts in piece_dict.values():
+            pts_sorted = sorted(pts, key=lambda x: x[0])
+            midpoints = [p for (_, p) in pts_sorted]
+            if midpoints:
+                pieces.append(midpoints)
+        data_by_rib[idx] = pieces
 
-        try:
-            intersection = wing_shape.section(plane)
-            if not intersection or not intersection.Edges:
-                continue
-
-            vertices = []
-            for edge in intersection.Edges:
-                vertices.append(edge.Vertexes[0].Point)
-                vertices.append(edge.Vertexes[-1].Point)
-
-            if not vertices:
-                continue
-
-            min_z = min(p.z for p in vertices)
-            max_z = max(p.z for p in vertices)
-            z_tol = 1e-4
-            low_pts  = [p for p in vertices if abs(p.z - min_z) <= z_tol]
-            high_pts = [p for p in vertices if abs(p.z - max_z) <= z_tol]
-
-            # Remove exact duplicates
-            unique_low = []
-            for p in low_pts:
-                if not any(p == q for q in unique_low):
-                    unique_low.append(p)
-            unique_high = []
-            for p in high_pts:
-                if not any(p == q for q in unique_high):
-                    unique_high.append(p)
-
-            data_by_rib[idx]['edge_cases'] = unique_low + unique_high
-
-        except Exception:
-            # Fallback: use min/max from midpoints
-            if data_by_rib[idx]['mid']:
-                mid_pts = data_by_rib[idx]['mid']
-                min_z = min(p.z for p in mid_pts)
-                max_z = max(p.z for p in mid_pts)
-                z_tol = 1e-4
-                low_pts  = [p for p in mid_pts if abs(p.z - min_z) <= z_tol]
-                high_pts = [p for p in mid_pts if abs(p.z - max_z) <= z_tol]
-                unique_low = []
-                for p in low_pts:
-                    if not any(p == q for q in unique_low):
-                        unique_low.append(p)
-                unique_high = []
-                for p in high_pts:
-                    if not any(p == q for q in unique_high):
-                        unique_high.append(p)
-                data_by_rib[idx]['edge_cases'] = unique_low + unique_high
-
-    # 3) Merge edge cases into midpoints:
-    #    For low and high extremes, if there are multiple points, add their centroid (midpoint).
-    #    If only one point, add that point.
-    for idx, data in data_by_rib.items():
-        if not data['edge_cases']:
-            continue
-        # Group low and high by Z (approx)
-        edge_pts = data['edge_cases']
-        # Find distinct Z groups (with tolerance)
-        z_groups = {}
-        for p in edge_pts:
-            z_key = round(p.z, 4)  # rounding to avoid floating issues
-            z_groups.setdefault(z_key, []).append(p)
-        # For each Z group, compute centroid
-        for z_key, pts in z_groups.items():
-            if len(pts) == 1:
-                centroid = pts[0]
-            else:
-                centroid = FreeCAD.Vector(0,0,0)
-                for p in pts:
-                    centroid += p
-                centroid /= len(pts)
-            # Add centroid if not already in midpoints (within tolerance)
-            already = any(centroid.isEqual(m, 1e-3) for m in data['mid'])
-            if not already:
-                data['mid'].append(centroid)
-
-    total_mid = sum(len(v['mid']) for v in data_by_rib.values())
-    total_edge = sum(len(v['edge_cases']) for v in data_by_rib.values())
-    print(f"Collected {total_mid} midpoints (including merged edge cases) and {total_edge} raw edge‑case points over {slice_count} slices.")
+    total_pieces = sum(len(v) for v in data_by_rib.values())
+    print(f"Collected {total_pieces} rib pieces (disconnected segments) over {slice_count} slices.")
     return data_by_rib
 # ------------------------------------------------------------
 # VISUALISATION
@@ -307,36 +240,26 @@ def show_points_per_rib(data_by_rib, doc, mode='mid', prefix='RibPoints'):
     total = sum(len(data['mid']) if mode=='mid' else len(data['edge_cases']) if mode=='edge_cases' else len(data['mid'])+len(data['edge_cases']) for data in data_by_rib.values())
     print(f"Visualized {count} ribs with {total} points (mode={mode}).")
 
+
 def create_rib_wires(data_by_rib, doc):
-    """
-    Create a wire (polyline) for each rib by connecting its midpoints
-    in order of increasing Z. Returns a compound of all wires.
-    """
     wires = []
-    for idx, data in data_by_rib.items():
-        pts = data['mid']
-        if len(pts) < 2:
-            continue
-        # Sort points by Z (lowest to highest)
-        pts_sorted = sorted(pts, key=lambda p: p.z)
-        # Build edges between consecutive points
-        edges = []
-        for i in range(len(pts_sorted)-1):
-            edges.append(Part.makeLine(pts_sorted[i], pts_sorted[i+1]))
-        if edges:
-            if len(edges) == 1:
-                wire = Part.Wire(edges[0])
-            else:
-                wire = Part.Wire(edges)
-            wires.append(wire)
+    for pieces in data_by_rib.values():
+        for piece_pts in pieces:
+            if len(piece_pts) < 2:
+                continue
+            pts_sorted = sorted(piece_pts, key=lambda p: p.z)
+            edges = [Part.makeLine(pts_sorted[i], pts_sorted[i+1]) for i in range(len(pts_sorted)-1)]
+            if edges:
+                wire = Part.Wire(edges) if len(edges) > 1 else Part.Wire(edges[0])
+                wires.append(wire)
     if wires:
         compound = Part.Compound(wires)
         obj = doc.addObject("Part::Feature", "RibWires")
         obj.Shape = compound
         if FreeCAD.GuiUp:
-            obj.ViewObject.LineColor = (0.0, 1.0, 0.0)  # green
+            obj.ViewObject.LineColor = (0.0, 1.0, 0.0)
             obj.ViewObject.LineWidth = 2
         doc.recompute()
-        print(f"Created {len(wires)} rib wires (total edges = {sum(len(w.Edges) for w in wires)}).")
+        print(f"Created {len(wires)} rib wires.")
     else:
-        print("No wires created (need at least 2 points per rib).")
+        print("No wires created.")
