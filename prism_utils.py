@@ -2,18 +2,22 @@
 import FreeCAD
 import Part
 
-def create_rectangular_prism_bridge(data_by_rib, rib_center_lines, plane_normal, rib_width, bridge_height, doc=None):
-    """
-    Create a solid rectangular prism around each rib wire by offsetting the
-    centreline in two perpendicular directions: rib normal and plane normal.
+def extend_rib_wire(pts_sorted, extend_len):
+    """Extend the first and last segment outward, return new list with two extra points."""
+    if len(pts_sorted) < 2:
+        return pts_sorted
+    dir0 = (pts_sorted[1] - pts_sorted[0]).normalize()
+    p_before = pts_sorted[0] - dir0 * extend_len
+    dir_last = (pts_sorted[-1] - pts_sorted[-2]).normalize()
+    p_after = pts_sorted[-1] + dir_last * extend_len
+    return [p_before] + pts_sorted + [p_after]
 
-    Parameters:
-        data_by_rib      : output of collect_rib_midpoints (contains 'mid' points)
-        rib_center_lines : original rib centre lines (to compute rib normals)
-        plane_normal     : construction plane normal (extrusion direction)
-        rib_width        : thickness of the rib cut (gap width)
-        bridge_height    : height of the bridge perpendicular to the rib plane
-        doc              : FreeCAD document
+def create_bridges_trimmed_to_wing(data_by_rib, rib_center_lines, plane_normal,
+                                   rib_width, bridge_height, wing_shape,
+                                   extend_length=5.0, doc=None):
+    """
+    For each rib, create a rectangular prism along the rib wire, extend it,
+    then intersect with the wing solid. Returns a compound of bridges.
     """
     if doc is None:
         doc = FreeCAD.ActiveDocument
@@ -33,19 +37,19 @@ def create_rectangular_prism_bridge(data_by_rib, rib_center_lines, plane_normal,
         pts = data['mid']
         if len(pts) < 2:
             continue
-        pts_sorted = sorted(pts, key=lambda p: p.z)   # bottom → top
+        pts_sorted = sorted(pts, key=lambda p: p.z)
+        pts_extended = extend_rib_wire(pts_sorted, extend_length)
+
         n_rib = rib_normals[idx]
         ext_dir = plane_normal.normalize()
         half_w = rib_width / 2.0
         half_h = bridge_height / 2.0
 
-        # For each segment, build a prism by connecting the offset quadrilaterals
         seg_prisms = []
-        for i in range(len(pts_sorted)-1):
-            p1 = pts_sorted[i]
-            p2 = pts_sorted[i+1]
+        for i in range(len(pts_extended)-1):
+            p1 = pts_extended[i]
+            p2 = pts_extended[i+1]
 
-            # Eight vertices (four at p1, four at p2)
             offs = [
                 ( half_w,  half_h),
                 ( half_w, -half_h),
@@ -55,21 +59,19 @@ def create_rectangular_prism_bridge(data_by_rib, rib_center_lines, plane_normal,
             v1 = [p1 + n_rib * w + ext_dir * h for (w, h) in offs]
             v2 = [p2 + n_rib * w + ext_dir * h for (w, h) in offs]
 
-            # Build six faces (4 side faces + 2 end caps)
             faces = []
-            # Side faces (quadrilaterals)
+            # side faces
             for j in range(4):
                 k = (j+1) % 4
-                face_vertices = [v1[j], v2[j], v2[k], v1[k]]
-                wire = Part.makePolygon(face_vertices + [face_vertices[0]])
+                verts = [v1[j], v2[j], v2[k], v1[k]]
+                wire = Part.makePolygon(verts + [verts[0]])
                 faces.append(Part.Face(wire))
-            # End faces at p1 and p2
+            # end caps
             wire1 = Part.makePolygon(v1 + [v1[0]])
             faces.append(Part.Face(wire1))
             wire2 = Part.makePolygon(v2 + [v2[0]])
             faces.append(Part.Face(wire2))
 
-            # Solid from faces
             try:
                 shell = Part.makeShell(faces)
                 if not shell.isNull():
@@ -77,14 +79,21 @@ def create_rectangular_prism_bridge(data_by_rib, rib_center_lines, plane_normal,
                     if not solid.isNull():
                         seg_prisms.append(solid)
             except Exception as e:
-                print(f"Error creating prism for rib {idx} segment {i}: {e}")
+                print(f"Error in segment {i} of rib {idx}: {e}")
 
         if seg_prisms:
-            # Fuse all prisms of this rib into one solid
+            # Fuse all segments of this rib into one solid
             fused = seg_prisms[0]
             for pr in seg_prisms[1:]:
                 fused = fused.fuse(pr)
-            all_bridges.append(fused)
+
+            # Trim the extended bridge to the wing shape
+            try:
+                trimmed = fused.common(wing_shape)
+                if not trimmed.isNull() and trimmed.Volume > 1e-6:
+                    all_bridges.append(trimmed)
+            except Exception as e:
+                print(f"Intersection failed for rib {idx}: {e}")
 
     if all_bridges:
         compound = Part.Compound(all_bridges)
@@ -94,7 +103,7 @@ def create_rectangular_prism_bridge(data_by_rib, rib_center_lines, plane_normal,
             obj.ViewObject.ShapeColor = (0.0, 0.8, 0.0)
             obj.ViewObject.Transparency = 30
         doc.recompute()
-        print(f"Created {len(all_bridges)} bridges (one per rib).")
+        print(f"Created {len(all_bridges)} trimmed bridges (one per rib).")
         return obj
     else:
         print("No bridges created.")

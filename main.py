@@ -4,7 +4,7 @@ import FreeCADGui
 import Part
 from slab_utils import LWInfillParams, create_cut_result, generate_final_solid
 from point_utils import collect_rib_midpoints, show_points_per_rib, create_rib_wires
-from prism_utils import create_rectangular_prism_bridge
+from prism_utils import create_bridges_trimmed_to_wing
 
 
 
@@ -90,11 +90,13 @@ if __name__ == "__main__":
         print(f"Added 'AllPoints' with {len(all_points)} points.")
 
 
-    create_rectangular_prism_bridge(
+    bridges = create_bridges_trimmed_to_wing(
         data_by_rib=points_by_rib,
         rib_center_lines=all_center_lines,
         plane_normal=params.plane_normal,
         rib_width=params.rib_width,
-        bridge_height=0.5,          # small height, adjust as needed
+        bridge_height=0.5,          # adjust as needed (small)
+        wing_shape=wing.Shape,      # the original solid to trim the bridges
+        extend_length=5.0,          # mm extension beyond the wire endpoints
         doc=doc
     )
