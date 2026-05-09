@@ -13,7 +13,7 @@ if __name__ == "__main__":
     doc_path = r"C:\Users\natha\git\ContinuousPath\wing.FCStd"
     doc = FreeCAD.open(doc_path)
 
-    wing = doc.getObject("Pocket")
+    wing = doc.getObject("Pad")
     if not wing:
         raise RuntimeError("Object 'Pad' not found in document.")
 
