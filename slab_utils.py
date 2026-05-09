@@ -145,7 +145,7 @@ def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, 
             pass
     return unified
 
-def create_cut_result(body, params, doc=None, vis=False):
+def create_cut_result(body, params, doc=None, vis_cut_wing=False, vis_centre_lines=False):
     """Returns (cut_shape, rib_center_lines, list_of_valid_rib_solids)"""
     if doc is None:
         doc = FreeCAD.ActiveDocument
@@ -189,9 +189,13 @@ def create_cut_result(body, params, doc=None, vis=False):
     fused_ribs = fuse_list(valid_ribs)
     cut_result = raw_shape.cut(fused_ribs)
 
-    if vis:
+    if vis_cut_wing:
         from viz_utils import show_cut_wing
         show_cut_wing(cut_result, doc, transparency=80)
+
+    if vis_centre_lines:
+        from viz_utils import show_rib_centre_lines
+        show_rib_centre_lines(all_center_lines, doc)
 
     return cut_result, all_center_lines, valid_ribs
 
@@ -225,7 +229,7 @@ def merge_and_show_final(cut_result, bridges_shape, doc, vis=True):
         show_final_solid(final, doc)
     return final
 
-def create_rib_centre_surfaces(wing_shape, rib_center_lines, plane_normal, tol=1e-4):
+def create_rib_centre_surfaces(wing_shape, rib_center_lines, plane_normal, doc, vis=False, tol=1e-4):
     """
     Returns (faces, edges).
     faces: list of Part.Face — one for each closed region (including holes)
@@ -304,7 +308,12 @@ def create_rib_centre_surfaces(wing_shape, rib_center_lines, plane_normal, tol=1
                             continue
         except Exception:
             continue
-
+    if vis:
+        from viz_utils import show_rib_centre_surfaces, show_rib_centre_edges
+        show_rib_centre_surfaces(faces, doc, color=(0.8, 0.4, 0.8), transparency=50)
+        print(f"Created {len(faces)} rib centre surfaces.")
+        show_rib_centre_edges(edges, doc, line_color=(0.2, 0.5, 1.0), line_width=2)
+        print(f"Created {len(edges)} rib centre edges.")
     return faces, all_edges
 
 def _lines_intersect_3d(p1, d1, p2, d2, tol=1.0):
@@ -413,7 +422,7 @@ def split_ribs_by_crossings(rib_solids, rib_center_lines, plane_normal, tol=1.0)
  
     return all_pieces
 
-def split_rib_faces_by_crossings(rib_faces, tol=1e-4):
+def split_rib_faces_by_crossings(rib_faces, doc, vis, tol=1e-4):
     """
     Cut each rib centre face by all other rib centre faces.
     Where two faces from different families cross, each is split
@@ -472,7 +481,9 @@ def split_rib_faces_by_crossings(rib_faces, tol=1e-4):
             current = next_fragments
  
         result_faces.extend(current)
- 
+    if vis:
+        from viz_utils import show_rib_segments
+        show_rib_segments(result_faces, doc)
     return result_faces
 
 def create_rectangular_cutout_from_boundary(face, margin=1.0):
@@ -596,3 +607,14 @@ def create_rectangular_cutout_from_boundary(face, margin=1.0):
         return None
     else:
         return process_single_face(face, margin)
+
+def cutouts_from_segmens(rib_centre_segments, doc, vis, margin):
+    cutouts = []
+    for seg in rib_centre_segments:
+        cut = create_rectangular_cutout_from_boundary(seg, margin=margin)
+        if cut:
+            cutouts.append(cut)
+    if vis:
+        from viz_utils import show_rect_cutouts
+        show_rect_cutouts(cutouts, doc, color=(1.0,0.5,0.0), transparency=30)
+    return cutouts
