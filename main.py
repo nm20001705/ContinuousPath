@@ -171,9 +171,26 @@ if __name__ == "__main__":
         else:
             print("No faces to segment.")
 
-    holed_faces = add_ellipse_holes_to_faces(segments, margin=2.0)
-    show_rib_centre_surfaces(holed_faces, doc, color=(0.2,0.8,0.4), transparency=50)
+    # holed_faces = add_ellipse_holes_to_faces(segments, margin=2.0)
+    # show_rib_centre_surfaces(holed_faces, doc, color=(0.2,0.8,0.4), transparency=50)
+
+    if True:
+        from slab_utils import create_rectangular_cutout_from_boundary
+        cutouts = []
+        for seg in segments:
+            cut = create_rectangular_cutout_from_boundary(seg)
+            
+            if cut:
+                cutouts.append(cut)
+                print("cut created")
+            else:
+                print("no cut")
+        if cutouts:
+            from viz_utils import show_rib_centre_surfaces
+            show_rib_centre_surfaces(cutouts, doc, color=(1.0,0.5,0.0), transparency=30)
+            print(f"Created {len(cutouts)} rectangular cutout faces.")
 
     fit_view(doc)
     doc.save()
     print("Document saved.")
+

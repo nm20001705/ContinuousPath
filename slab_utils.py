@@ -611,3 +611,92 @@ def add_ellipse_holes_to_faces(faces, margin=0.5):
         except:
             holed_faces.append(face)
     return holed_faces
+
+def create_rectangular_cutout_from_boundary(face, tol_z=1e-4):
+    """
+    For a planar face (rib segment), compute a quadrilateral cutout.
+    Returns a Part.Face or None.
+    """
+    wires = face.Wires
+    if not wires:
+        return None
+    wire = wires[0]
+
+    # Get all vertices of the wire (no duplicates)
+    vertices = []
+    for edge in wire.Edges:
+        vertices.append(edge.Vertexes[0].Point)
+        vertices.append(edge.Vertexes[-1].Point)
+    uniq = []
+    for p in vertices:
+        if not any(p.distanceToPoint(q) < 1e-4 for q in uniq):
+            uniq.append(p)
+    if len(uniq) < 4:
+        print("  [debug] too few vertices")
+        return None
+
+    # Group by Z (rounded)
+    z_groups = {}
+    for p in uniq:
+        key = round(p.z, 4)
+        z_groups.setdefault(key, []).append(p)
+    # Find min and max Z groups
+    z_min = min(z_groups.keys())
+    z_max = max(z_groups.keys())
+    low_pts = z_groups[z_min]
+    high_pts = z_groups[z_max]
+    # Compute centroids of extreme points
+    low_cent = FreeCAD.Vector(0,0,0)
+    for p in low_pts: low_cent += p
+    low_cent /= len(low_pts)
+    high_cent = FreeCAD.Vector(0,0,0)
+    for p in high_pts: high_cent += p
+    high_cent /= len(high_pts)
+
+    z_mid = (low_cent.z + high_cent.z) / 2.0
+
+    # Use face.section to get intersection wire at mid height
+    plane = Part.Plane(FreeCAD.Vector(0,0,z_mid), FreeCAD.Vector(0,0,1))
+    try:
+        section = face.section(plane)
+    except:
+        print("  [debug] section failed")
+        return None
+    if not section or len(section.Edges) == 0:
+        print("  [debug] no section edges")
+        return None
+
+    # Extract all vertices from the section edges
+    all_pts = []
+    for edge in section.Edges:
+        all_pts.append(edge.Vertexes[0].Point)
+        all_pts.append(edge.Vertexes[-1].Point)
+    uniq_mid = []
+    for p in all_pts:
+        if not any(p.distanceToPoint(q) < 1e-4 for q in uniq_mid):
+            uniq_mid.append(p)
+    if len(uniq_mid) == 2:
+        left_mid = min(uniq_mid, key=lambda p: p.x)
+        right_mid = max(uniq_mid, key=lambda p: p.x)
+    else:
+        # Fallback: if more than 2, take the two with min and max X
+        if len(uniq_mid) > 2:
+            uniq_mid.sort(key=lambda p: p.x)
+            left_mid = uniq_mid[0]
+            right_mid = uniq_mid[-1]
+        else:
+            print(f"  [debug] mid-plane intersections: expected 2, got {len(uniq_mid)}")
+            return None
+
+    # Build quadrilateral: bottom, left, top, right
+    ordered = [low_cent, left_mid, high_cent, right_mid]
+    try:
+        wire_out = Part.makePolygon(ordered + [ordered[0]])
+        face_out = Part.Face(wire_out)
+        if face_out.isValid():
+            return face_out
+        else:
+            print("  [debug] resulting face invalid")
+    except Exception as e:
+        print(f"  [debug] polygon/face error: {e}")
+    return None
