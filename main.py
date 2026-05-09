@@ -1,7 +1,7 @@
 import FreeCAD
 import FreeCADGui
 import Part
-from slab_utils import create_cut_result, merge_and_show_final, add_ellipse_holes_to_faces
+from slab_utils import create_cut_result, merge_and_show_final, create_rectangular_cutout_from_boundary
 from point_utils import collect_rib_midpoints, create_rib_wires
 from prism_utils import create_bridges_trimmed_to_wing
 from viz_utils import fit_view
@@ -21,7 +21,7 @@ PLANE_DEFS = {
 class LWInfillParams:
     def __init__(self, nozzle_diameter=0.4, wall_thickness=None,
                  rib_spacing=5.0, rib_width=None, rib_angle=30.0,
-                 grid_orientation=0.0, primary_dir=None, z_step=10,
+                 grid_orientation=0.0, primary_dir=None, z_step=10, cutout_marging=2,
                  construction_plane='XZ',
                  vis_cut_wing=True,
                  vis_rib_centre_surfaces=True,
@@ -30,7 +30,8 @@ class LWInfillParams:
                  vis_wires=True,
                  vis_bridges=True,
                  vis_rib_surface_segments=True,
-                 vis_final_solid=True):
+                 vis_final_solid=True, 
+                 vis_rect_cutouts = True):
         if construction_plane not in PLANE_DEFS:
             raise ValueError(f"construction_plane must be one of {list(PLANE_DEFS.keys())}")
         self.nozzle_diameter = nozzle_diameter
@@ -46,6 +47,7 @@ class LWInfillParams:
         self.plane_axis_v = pdef['axis_v']
         self.primary_dir = self._project_primary(primary_dir)
         self.z_step = z_step
+        self.cutout_marging=cutout_marging
         self.vis_cut_wing = vis_cut_wing
         self.vis_centre_lines = vis_centre_lines
         self.vis_midpoints = vis_midpoints
@@ -54,6 +56,7 @@ class LWInfillParams:
         self.vis_rib_surface_segments = vis_rib_surface_segments
         self.vis_rib_centre_surfaces = vis_rib_centre_surfaces
         self.vis_final_solid = vis_final_solid
+        self.vis_rect_cutouts = vis_rect_cutouts
 
     def _project_primary(self, pd):
         if pd is None:
@@ -71,7 +74,7 @@ if __name__ == "__main__":
     doc_path = r"C:\Users\natha\git\ContinuousPath\wing.FCStd"
     doc = FreeCAD.open(doc_path)
 
-    wing = doc.getObject("Pad")
+    wing = doc.getObject("Pocket")
     if not wing:
         raise RuntimeError("Object 'Pad' not found.")
 
@@ -174,21 +177,18 @@ if __name__ == "__main__":
     # holed_faces = add_ellipse_holes_to_faces(segments, margin=2.0)
     # show_rib_centre_surfaces(holed_faces, doc, color=(0.2,0.8,0.4), transparency=50)
 
-    if True:
-        from slab_utils import create_rectangular_cutout_from_boundary
+    if params.vis_rect_cutouts:
+        from viz_utils import show_rect_cutouts
         cutouts = []
         for seg in segments:
-            cut = create_rectangular_cutout_from_boundary(seg)
-            
+            cut = create_rectangular_cutout_from_boundary(seg, margin=2.0)
             if cut:
                 cutouts.append(cut)
-                print("cut created")
-            else:
-                print("no cut")
         if cutouts:
-            from viz_utils import show_rib_centre_surfaces
-            show_rib_centre_surfaces(cutouts, doc, color=(1.0,0.5,0.0), transparency=30)
+            show_rect_cutouts(cutouts, doc, color=(1.0,0.5,0.0), transparency=30)
             print(f"Created {len(cutouts)} rectangular cutout faces.")
+        else:
+            print("No cutout faces created.")
 
     fit_view(doc)
     doc.save()

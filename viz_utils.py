@@ -106,38 +106,9 @@ def show_rib_segments(pieces, doc, color=(0.2, 0.8, 0.4), transparency=30):
     return show_shape("RibSegments", compound, doc,
                       color=color, transparency=transparency)
 
-    """Create an ellipse wire and face in 3D."""
-    # We need to build the ellipse in the local plane and rotate it.
-    # For simplicity, create a circle and scale if a != b.
-    # But proper ellipse: define a wire of 3D points.
-    points = []
-    for t in range(0, 360, 10):
-        rad = math.radians(t)
-        # Local coordinates
-        x = a * math.cos(rad)
-        y = b * math.sin(rad)
-        # Rotate by ang around normal
-        # Build rotation matrix: X' = (cos ang, sin ang), Y' = (-sin ang, cos ang) in the plane
-        # Need two axes in the plane perpendicular to normal.
-        # We assume centre_3d is in 3D; we need to define u and v orthonormal in the plane.
-        # Use arbitrary u and v from face's normal.
-        n = normal.normalize()
-        if abs(n.x) < 0.9:
-            u = FreeCAD.Vector(1,0,0).cross(n).normalize()
-        else:
-            u = FreeCAD.Vector(0,1,0).cross(n).normalize()
-        v = n.cross(u).normalize()
-        # Rotate (x,y) by angle ang
-        xx = x * math.cos(ang) - y * math.sin(ang)
-        yy = x * math.sin(ang) + y * math.cos(ang)
-        pt_3d = center_3d + u * xx + v * yy
-        points.append(pt_3d)
-    wire = Part.makePolygon(points + [points[0]])
-    face = Part.Face(wire)
-    obj = doc.addObject("Part::Feature", "Ellipse")
-    obj.Shape = face
-    if FreeCAD.GuiUp:
-        obj.ViewObject.ShapeColor = color
-        obj.ViewObject.Transparency = 30
-    doc.recompute()
-    return obj
+def show_rect_cutouts(faces, doc, color=(1.0,0.5,0.0), transparency=30):
+    """Display the rectangular cutout faces (orange)."""
+    if not faces:
+        return None
+    compound = Part.Compound(faces)
+    return show_shape("RectCutouts", compound, doc, color=color, transparency=transparency, display_mode="Shaded")

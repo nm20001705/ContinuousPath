@@ -612,17 +612,13 @@ def add_ellipse_holes_to_faces(faces, margin=0.5):
             holed_faces.append(face)
     return holed_faces
 
-def create_rectangular_cutout_from_boundary(face, tol_z=1e-4):
-    """
-    For a planar face (rib segment), compute a quadrilateral cutout.
-    Returns a Part.Face or None.
-    """
+def create_rectangular_cutout_from_boundary(face, margin=1.0):
     wires = face.Wires
     if not wires:
         return None
     wire = wires[0]
 
-    # Get all vertices of the wire (no duplicates)
+    # Collect vertices
     vertices = []
     for edge in wire.Edges:
         vertices.append(edge.Vertexes[0].Point)
@@ -632,20 +628,17 @@ def create_rectangular_cutout_from_boundary(face, tol_z=1e-4):
         if not any(p.distanceToPoint(q) < 1e-4 for q in uniq):
             uniq.append(p)
     if len(uniq) < 4:
-        print("  [debug] too few vertices")
         return None
 
-    # Group by Z (rounded)
+    # Group by Z
     z_groups = {}
     for p in uniq:
         key = round(p.z, 4)
         z_groups.setdefault(key, []).append(p)
-    # Find min and max Z groups
     z_min = min(z_groups.keys())
     z_max = max(z_groups.keys())
     low_pts = z_groups[z_min]
     high_pts = z_groups[z_max]
-    # Compute centroids of extreme points
     low_cent = FreeCAD.Vector(0,0,0)
     for p in low_pts: low_cent += p
     low_cent /= len(low_pts)
@@ -655,48 +648,70 @@ def create_rectangular_cutout_from_boundary(face, tol_z=1e-4):
 
     z_mid = (low_cent.z + high_cent.z) / 2.0
 
-    # Use face.section to get intersection wire at mid height
+    # Mid plane
     plane = Part.Plane(FreeCAD.Vector(0,0,z_mid), FreeCAD.Vector(0,0,1))
     try:
         section = face.section(plane)
     except:
-        print("  [debug] section failed")
         return None
     if not section or len(section.Edges) == 0:
-        print("  [debug] no section edges")
         return None
 
-    # Extract all vertices from the section edges
-    all_pts = []
+    mid_pts = []
     for edge in section.Edges:
-        all_pts.append(edge.Vertexes[0].Point)
-        all_pts.append(edge.Vertexes[-1].Point)
+        mid_pts.append(edge.Vertexes[0].Point)
+        mid_pts.append(edge.Vertexes[-1].Point)
     uniq_mid = []
-    for p in all_pts:
+    for p in mid_pts:
         if not any(p.distanceToPoint(q) < 1e-4 for q in uniq_mid):
             uniq_mid.append(p)
-    if len(uniq_mid) == 2:
-        left_mid = min(uniq_mid, key=lambda p: p.x)
-        right_mid = max(uniq_mid, key=lambda p: p.x)
-    else:
-        # Fallback: if more than 2, take the two with min and max X
-        if len(uniq_mid) > 2:
-            uniq_mid.sort(key=lambda p: p.x)
-            left_mid = uniq_mid[0]
-            right_mid = uniq_mid[-1]
-        else:
-            print(f"  [debug] mid-plane intersections: expected 2, got {len(uniq_mid)}")
-            return None
+    if len(uniq_mid) < 2:
+        return None
+    # Farthest pair
+    best_pair = None
+    max_dist = 0.0
+    for i in range(len(uniq_mid)):
+        for j in range(i+1, len(uniq_mid)):
+            d = uniq_mid[i].distanceToPoint(uniq_mid[j])
+            if d > max_dist:
+                max_dist = d
+                best_pair = (uniq_mid[i], uniq_mid[j])
+    if best_pair is None:
+        return None
+    left_mid, right_mid = best_pair
+    if left_mid.x > right_mid.x:
+        left_mid, right_mid = right_mid, left_mid
 
-    # Build quadrilateral: bottom, left, top, right
-    ordered = [low_cent, left_mid, high_cent, right_mid]
+    # Compute centroid of the four points
+    centroid = (low_cent + left_mid + high_cent + right_mid) / 4.0
+    # Shift each point toward centroid by margin (i.e., scale inward)
+    def shift_towards(pt, center, margin):
+        dir_vec = pt - center
+        if dir_vec.Length < 1e-6:
+            return pt
+        return pt - dir_vec.normalize() * margin
+
+    low_shifted = shift_towards(low_cent, centroid, margin)
+    high_shifted = shift_towards(high_cent, centroid, margin)
+    left_shifted = shift_towards(left_mid, centroid, margin)
+    right_shifted = shift_towards(right_mid, centroid, margin)
+
+    ordered = [low_shifted, left_shifted, high_shifted, right_shifted]
     try:
         wire_out = Part.makePolygon(ordered + [ordered[0]])
         face_out = Part.Face(wire_out)
-        if face_out.isValid():
-            return face_out
-        else:
-            print("  [debug] resulting face invalid")
-    except Exception as e:
-        print(f"  [debug] polygon/face error: {e}")
+        if face_out.isValid() and face_out.Area > 1e-4:
+            # Sample points: vertices and a few interior points
+            sample_points = [low_shifted, left_shifted, high_shifted, right_shifted,
+                            (low_shifted + high_shifted) * 0.5,
+                            (left_shifted + right_shifted) * 0.5]
+            inside = True
+            for p in sample_points:
+                if not face.isInside(p, 1e-3, True):
+                    inside = False
+                    break
+            if inside:
+                return face_out
+    except:
+        pass
     return None
