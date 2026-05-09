@@ -106,7 +106,6 @@ def show_rib_segments(pieces, doc, color=(0.2, 0.8, 0.4), transparency=30):
     return show_shape("RibSegments", compound, doc,
                       color=color, transparency=transparency)
 
-def add_ellipse_to_doc(center_3d, a, b, ang, normal, doc, color=(1.0,0.0,0.0)):
     """Create an ellipse wire and face in 3D."""
     # We need to build the ellipse in the local plane and rotate it.
     # For simplicity, create a circle and scale if a != b.
