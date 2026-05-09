@@ -2,12 +2,10 @@
 import FreeCAD
 import FreeCADGui
 import Part
-from slab_utils import LWInfillParams, create_cut_result, generate_final_solid
-from point_utils import collect_rib_midpoints, show_points_per_rib, create_rib_wires
+from slab_utils import LWInfillParams, create_cut_result, merge_and_show_final
+from point_utils import collect_rib_midpoints, create_rib_wires
 from prism_utils import create_bridges_trimmed_to_wing
-
-
-
+from viz_utils import show_final_solid, fit_view
 
 if __name__ == "__main__":
     doc_path = r"C:\Users\natha\git\ContinuousPath\wing.FCStd"
@@ -15,81 +13,50 @@ if __name__ == "__main__":
 
     wing = doc.getObject("Pad")
     if not wing:
-        raise RuntimeError("Object 'Pad' not found in document.")
+        raise RuntimeError("Object 'Pad' not found.")
 
     params = LWInfillParams(
-        nozzle_diameter  = 0.4,
-        rib_spacing      = 20.0,
-        rib_width        = 0.1,
-        rib_angle        = 30.0,
-        grid_orientation = 0.0,
-        primary_dir      = FreeCAD.Vector(0, 0, 1),
-        construction_plane = 'XZ'
+        nozzle_diameter=0.4,
+        rib_spacing=70.0,
+        rib_width=0.1,
+        rib_angle=30.0,
+        grid_orientation=0.0,
+        z_step = 10,
+        primary_dir=FreeCAD.Vector(0, 0, 1),
+        construction_plane='XZ',
+        vis_cut_wing=False,
+        vis_centre_lines=False,
+        vis_midpoints=False,
+        vis_wires=False,
+        vis_bridges=False,
+        vis_final_solid=True
     )
 
-    # 1. Create cut result
-    cut_result, all_center_lines, all_rib_solids = create_cut_result(wing.Shape, params, doc)
+    # 1. Create cut result (cut wing is shown internally if vis_cut_wing is True)
+    cut_result, all_center_lines, _ = create_cut_result(wing.Shape, params, doc, vis=params.vis_cut_wing)
     print("Cut created.")
 
-    # --- Visualise cut wing ---
-    cut_obj = doc.addObject("Part::Feature", "CutWing")
-    cut_obj.Shape = cut_result
-    doc.recompute()
+    # 2. Visualise rib centre lines (if flag is True)
+    if params.vis_centre_lines:
+        from viz_utils import show_rib_centre_lines
+        show_rib_centre_lines(all_center_lines, doc)
 
-    if FreeCAD.GuiUp:
-        FreeCADGui.SendMsgToActiveView("ViewFit")
-        view_provider = FreeCADGui.ActiveDocument.getObject(cut_obj.Name)
-        if view_provider and hasattr(view_provider, "ViewObject"):
-            view_provider.ViewObject.Transparency = 80
-            print("Cut wing set to 80% transparency.")
-        else:
-            print("Could not set transparency – view object not ready.")
-    else:
-        print("No GUI – transparency not set.")
-
-    # 2. Visualise rib centre lines
-    rib_lines_compound = Part.Compound([line for line in all_center_lines])
-    obj_lines = doc.addObject("Part::Feature", "RibCentreLines")
-    obj_lines.Shape = rib_lines_compound
-    if FreeCAD.GuiUp:
-        line_view = FreeCADGui.ActiveDocument.getObject(obj_lines.Name)
-        if line_view and hasattr(line_view, "ViewObject"):
-            line_view.ViewObject.LineColor = (1.0, 0.0, 0.0)  # red
-    doc.recompute()
-    print(f"Visualized {len(all_center_lines)} rib centre lines.")
-
-    # 3. Collect midpoints
+    # 3. Collect midpoints and optionally visualise them
     bb = wing.Shape.BoundBox
     z_min = bb.ZMin + 0.5
     z_max = bb.ZMax - 0.5
-    z_step = 10
-    print(f"Collecting midpoints from z={z_min:.1f} to {z_max:.1f}, step={z_step:.1f}...")
     points_by_rib = collect_rib_midpoints(
         wing_shape=wing.Shape,
         rib_center_lines=all_center_lines,
         plane_normal=params.plane_normal,
-        z_min=bb.ZMin + 0.5,
-        z_max=bb.ZMax - 0.5,
-        z_step=z_step,
+        z_min=z_min, z_max=z_max, z_step=params.z_step,
+        doc=doc, vis=params.vis_midpoints
     )
 
-    # show_points_per_rib(points_by_rib, doc, mode='mid', prefix="RibMidpoints")
-    # show_points_per_rib(points_by_rib, doc, mode='edge_cases', prefix="RibEdgeCases")
-    create_rib_wires(points_by_rib, doc)
-    # Combine all points for a global view
-    all_points = []
-    for data in points_by_rib.values():
-        all_points.extend(data['mid'])
-        all_points.extend(data['edge_cases'])
-    if all_points:
-        vertices = [Part.Vertex(p) for p in all_points]
-        compound = Part.Compound(vertices)
-        obj = doc.addObject("Part::Feature", "AllPoints")
-        obj.Shape = compound
-        doc.recompute()
-        print(f"Added 'AllPoints' with {len(all_points)} points.")
+    # 4. Create rib wires and optionally visualise them
+    wires = create_rib_wires(points_by_rib, doc, vis=params.vis_wires)
 
-
+    # 5. Create bridges and optionally visualise them
     bridges = create_bridges_trimmed_to_wing(
         data_by_rib=points_by_rib,
         rib_center_lines=all_center_lines,
@@ -98,18 +65,17 @@ if __name__ == "__main__":
         bridge_height=0.5,
         wing_shape=wing.Shape,
         extend_length=5.0,
-        doc=doc
+        doc=doc,
+        vis=params.vis_bridges
     )
 
-    # 5. Merge cut wing with bridges to create a single solid
+    # 6. Merge and show final solid
     if bridges:
-        final_solid = cut_result.fuse(bridges.Shape)
-        final_obj = doc.addObject("Part::Feature", "WingWithBridges")
-        final_obj.Shape = final_solid
-        if FreeCAD.GuiUp:
-            final_obj.ViewObject.ShapeColor = (0.8, 0.8, 0.8)
-            final_obj.ViewObject.Transparency = 0
-        doc.recompute()
+        final_solid = merge_and_show_final(cut_result, bridges, doc, vis=params.vis_final_solid)
         print("Final solid (wing + bridges) created successfully.")
     else:
-        print("No bridges created – cannot merge.")
+        print("No bridges created – final solid not produced.")
+
+    fit_view(doc)
+    doc.save()
+    print("Document saved.")

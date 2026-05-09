@@ -18,8 +18,13 @@ PLANE_DEFS = {
 class LWInfillParams:
     def __init__(self, nozzle_diameter=0.4, wall_thickness=None,
                  rib_spacing=5.0, rib_width=None, rib_angle=30.0,
-                 grid_orientation=0.0, primary_dir=None,
-                 construction_plane='XZ'):
+                 grid_orientation=0.0, primary_dir=None, z_step=10,
+                 construction_plane='XZ', vis_cut_wing=True,
+                    vis_centre_lines=True,
+                    vis_midpoints=True,
+                    vis_wires=True,
+                    vis_bridges=True,
+                    vis_final_solid=True, ):
         if construction_plane not in PLANE_DEFS:
             raise ValueError(f"construction_plane must be one of {list(PLANE_DEFS.keys())}")
         self.nozzle_diameter = nozzle_diameter
@@ -34,6 +39,13 @@ class LWInfillParams:
         self.plane_axis_u = pdef['axis_u']
         self.plane_axis_v = pdef['axis_v']
         self.primary_dir = self._project_primary(primary_dir)
+        self.z_step=z_step
+        self.vis_cut_wing = vis_cut_wing
+        self.vis_centre_lines = vis_centre_lines
+        self.vis_midpoints = vis_midpoints
+        self.vis_wires = vis_wires
+        self.vis_bridges = vis_bridges
+        self.vis_final_solid = vis_final_solid
 
     def _project_primary(self, pd):
         if pd is None:
@@ -188,7 +200,7 @@ def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, 
             pass
     return unified
 
-def create_cut_result(body, params, doc=None):
+def create_cut_result(body, params, doc=None, vis=False):
     """Returns (cut_shape, rib_center_lines, list_of_valid_rib_solids)"""
     if doc is None:
         doc = FreeCAD.ActiveDocument
@@ -205,15 +217,10 @@ def create_cut_result(body, params, doc=None):
     rib_solids2 = extrude_rib_faces_to_solids(rib_faces2, params.plane_normal, bb)
     all_rib_solids = rib_solids1 + rib_solids2
 
-    # ------------------------------------------------------------
-    # FILTER: keep only ribs that significantly intersect the wing
-    # ------------------------------------------------------------
     valid_ribs = []
     for rib in all_rib_solids:
         try:
-            # Intersect the rib solid with the wing
             common = rib.common(raw_shape)
-            # If the common shape has volume less than 1 mm³, discard it
             if common is None or common.Volume < 1.0:
                 continue
             valid_ribs.append(rib)
@@ -223,7 +230,6 @@ def create_cut_result(body, params, doc=None):
     if not valid_ribs:
         raise ValueError("No rib solids significantly intersect the wing.")
 
-    # Fuse the valid ribs for cutting
     def fuse_list(lst):
         if not lst:
             return None
@@ -237,6 +243,10 @@ def create_cut_result(body, params, doc=None):
 
     fused_ribs = fuse_list(valid_ribs)
     cut_result = raw_shape.cut(fused_ribs)
+
+    if vis:
+        from viz_utils import show_cut_wing
+        show_cut_wing(cut_result, doc, transparency=80)
 
     return cut_result, all_center_lines, valid_ribs
 
@@ -254,3 +264,18 @@ def generate_final_solid(body, params, doc=None, add_bridges=True):
         obj.Shape = result
         doc.recompute()
     return result
+
+
+def merge_and_show_final(cut_result, bridges_shape, doc, vis=True):
+    """
+    Fuse the cut wing with the bridges shape.
+    If vis is True, display the final solid using viz_utils.show_final_solid.
+    Returns the fused solid (or None if bridges_shape is invalid).
+    """
+    if not bridges_shape or bridges_shape.isNull():
+        return None
+    final = cut_result.fuse(bridges_shape)
+    if vis:
+        from viz_utils import show_final_solid
+        show_final_solid(final, doc)
+    return final

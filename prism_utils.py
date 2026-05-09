@@ -14,7 +14,7 @@ def extend_rib_wire(pts_sorted, extend_len):
 
 def create_bridges_trimmed_to_wing(data_by_rib, rib_center_lines, plane_normal,
                                    rib_width, bridge_height, wing_shape,
-                                   extend_length=5.0, doc=None):
+                                   extend_length=5.0, doc=None, vis=False):
     """
     For each rib, create a rectangular prism along the rib wire, extend it,
     then intersect with the wing solid. Returns a compound of bridges.
@@ -97,14 +97,10 @@ def create_bridges_trimmed_to_wing(data_by_rib, rib_center_lines, plane_normal,
 
     if all_bridges:
         compound = Part.Compound(all_bridges)
-        obj = doc.addObject("Part::Feature", "Bridges")
-        obj.Shape = compound
-        if FreeCAD.GuiUp:
-            obj.ViewObject.ShapeColor = (0.0, 0.8, 0.0)
-            obj.ViewObject.Transparency = 30
-        doc.recompute()
-        print(f"Created {len(all_bridges)} trimmed bridges (one per rib).")
-        return obj
+        if vis:
+            from viz_utils import show_bridges
+            show_bridges(compound, doc)
+        return compound   # return the shape, not an object
     else:
         print("No bridges created.")
         return None

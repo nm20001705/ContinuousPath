@@ -167,7 +167,8 @@ def _clip_line_to_wing_wires(point_on_line, line_dir, wires, max_len=2000.0):
 # ------------------------------------------------------------
 # MAIN COLLECTION (corrected edge‑case detection)
 # ------------------------------------------------------------
-def collect_rib_midpoints(wing_shape, rib_center_lines, plane_normal, z_min, z_max, z_step):
+def collect_rib_midpoints(wing_shape, rib_center_lines, plane_normal, z_min, z_max, z_step, doc=None, vis=False):
+    data_by_rib = defaultdict(lambda: {'mid': [], 'edge_cases': []})
     data_by_rib = defaultdict(lambda: {'mid': [], 'edge_cases': []})
     max_len = math.sqrt(wing_shape.BoundBox.XLength**2 + wing_shape.BoundBox.YLength**2) * 2
 
@@ -278,7 +279,17 @@ def collect_rib_midpoints(wing_shape, rib_center_lines, plane_normal, z_min, z_m
     total_mid = sum(len(v['mid']) for v in data_by_rib.values())
     total_edge = sum(len(v['edge_cases']) for v in data_by_rib.values())
     print(f"Collected {total_mid} midpoints (including merged edge cases) and {total_edge} raw edge‑case points over {slice_count} slices.")
+    if vis:
+        all_points = []
+        for data in data_by_rib.values():
+            all_points.extend(data['mid'])
+            all_points.extend(data['edge_cases'])
+        if all_points:
+            from viz_utils import show_midpoints
+            show_midpoints(all_points, doc, point_size=5)
+
     return data_by_rib
+
 # ------------------------------------------------------------
 # VISUALISATION
 # ------------------------------------------------------------
@@ -307,36 +318,22 @@ def show_points_per_rib(data_by_rib, doc, mode='mid', prefix='RibPoints'):
     total = sum(len(data['mid']) if mode=='mid' else len(data['edge_cases']) if mode=='edge_cases' else len(data['mid'])+len(data['edge_cases']) for data in data_by_rib.values())
     print(f"Visualized {count} ribs with {total} points (mode={mode}).")
 
-def create_rib_wires(data_by_rib, doc):
+def create_rib_wires(data_by_rib, doc, vis=False):
     """
-    Create a wire (polyline) for each rib by connecting its midpoints
-    in order of increasing Z. Returns a compound of all wires.
+    Create wires (polylines) for each rib by connecting midpoints in Z order.
+    Returns a list of Part.Wire objects (or empty list).
     """
     wires = []
     for idx, data in data_by_rib.items():
         pts = data['mid']
         if len(pts) < 2:
             continue
-        # Sort points by Z (lowest to highest)
         pts_sorted = sorted(pts, key=lambda p: p.z)
-        # Build edges between consecutive points
-        edges = []
-        for i in range(len(pts_sorted)-1):
-            edges.append(Part.makeLine(pts_sorted[i], pts_sorted[i+1]))
+        edges = [Part.makeLine(pts_sorted[i], pts_sorted[i+1]) for i in range(len(pts_sorted)-1)]
         if edges:
-            if len(edges) == 1:
-                wire = Part.Wire(edges[0])
-            else:
-                wire = Part.Wire(edges)
+            wire = Part.Wire(edges) if len(edges) > 1 else Part.Wire(edges[0])
             wires.append(wire)
-    if wires:
-        compound = Part.Compound(wires)
-        obj = doc.addObject("Part::Feature", "RibWires")
-        obj.Shape = compound
-        if FreeCAD.GuiUp:
-            obj.ViewObject.LineColor = (0.0, 1.0, 0.0)  # green
-            obj.ViewObject.LineWidth = 2
-        doc.recompute()
-        print(f"Created {len(wires)} rib wires (total edges = {sum(len(w.Edges) for w in wires)}).")
-    else:
-        print("No wires created (need at least 2 points per rib).")
+    if vis and wires:
+        from viz_utils import show_rib_wires
+        show_rib_wires(wires, doc)
+    return wires
