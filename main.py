@@ -72,34 +72,48 @@ class LWInfillParams:
             return None
         return proj.normalize()
 
-
 def main(params):
-    # load object
     doc = FreeCAD.open(params.doc_path)
     wing = doc.getObject(params.obj_name)
-    bb = wing.Shape.BoundBox
     if not wing:
-        raise RuntimeError("Object 'Pad' not found.")
-    
-    # make ribs
+        raise RuntimeError("Object not found.")
+
+    bb = wing.Shape.BoundBox
+
+    # 1. Compute grid lines and centre lines
+    from slab_utils import create_angled_grid_lines
+    lines1, lines2 = create_angled_grid_lines(bb, params)
+    all_center_lines = lines1 + lines2
+
+    # 2. Generate rib centre surfaces and segments
+    rib_centre_surfaces, _ = create_rib_centre_surfaces(wing.Shape, all_center_lines, params.plane_normal, doc, vis=params.vis_rib_centre_surfaces)
+    rib_centre_segments = split_rib_faces_by_crossings(rib_centre_surfaces, doc, vis=params.vis_rib_surface_segments)
+
+    # 3. Create cutout faces (rectangular holes)
+    cutout_faces = cutouts_from_segmens(rib_centre_segments, doc, vis=params.vis_rect_cutouts, margin=params.cutout_marging)
+
+    # 4. Create cut result with holes (the cutout faces are used to subtract holes from ribs)
     cut_result, all_center_lines, valid_ribs = create_cut_result(
-        wing.Shape, params, doc, vis_cut_wing=params.vis_cut_wing, vis_centre_lines=params.vis_centre_lines
+        wing.Shape, params, doc,
+        vis_cut_wing=params.vis_cut_wing,
+        vis_centre_lines=params.vis_centre_lines,
+        cutout_faces=cutout_faces
     )
 
-    # get the bridges
-    points_by_rib = collect_rib_midpoints(wing_shape=wing.Shape,rib_center_lines=all_center_lines,plane_normal=params.plane_normal,z_min=bb.ZMin + 0.5,z_max=bb.ZMax - 0.5,z_step=params.z_step,doc=doc,vis=params.vis_midpoints,)
+    # 5. Bridges (midpoints, wires, bridges)
+    points_by_rib = collect_rib_midpoints(wing_shape=wing.Shape, rib_center_lines=all_center_lines,
+                                          plane_normal=params.plane_normal,
+                                          z_min=bb.ZMin+0.5, z_max=bb.ZMax-0.5,
+                                          z_step=params.z_step, doc=doc, vis=params.vis_midpoints)
     wires = create_rib_wires(points_by_rib, doc, vis=params.vis_wires)
-    bridges = create_bridges_trimmed_to_wing(data_by_rib=points_by_rib,rib_center_lines=all_center_lines,plane_normal=params.plane_normal,rib_width=params.rib_width,bridge_height=0.5,wing_shape=wing.Shape,extend_length=5.0,doc=doc,vis=params.vis_bridges,)
+    bridges = create_bridges_trimmed_to_wing(data_by_rib=points_by_rib, rib_center_lines=all_center_lines,
+                                             plane_normal=params.plane_normal, rib_width=params.rib_width,
+                                             bridge_height=0.5, wing_shape=wing.Shape, extend_length=5.0,
+                                             doc=doc, vis=params.vis_bridges)
 
-    # Final solid
+    # 6. Final solid
     final_solid = merge_and_show_final(cut_result, bridges, doc, vis=params.vis_final_solid)
     print("Final solid (wing + bridges) created successfully.")
-
-    rib_centre_surfaces, rib_centre_edges = create_rib_centre_surfaces(wing.Shape, all_center_lines, params.plane_normal, doc = doc, vis=params.vis_rib_centre_surfaces)
-    rib_centre_segments = split_rib_faces_by_crossings(rib_centre_surfaces, doc=doc, vis=params.vis_rib_surface_segments)
-    print(params.vis_rect_cutouts)
-    rib_centre_cutout = cutouts_from_segmens(rib_centre_segments, doc=doc, vis=params.vis_rect_cutouts, margin=params.cutout_marging)
-
 
     fit_view(doc)
     doc.save()
@@ -107,8 +121,9 @@ def main(params):
 
 if __name__ == "__main__":
     params = LWInfillParams(
+        obj_name='Scale',
         nozzle_diameter=0.4,
-        rib_spacing=70.0,
+        rib_spacing=30.0,
         rib_width=0.1,
         rib_angle=30.0,
         grid_orientation=0.0,

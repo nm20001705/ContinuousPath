@@ -145,7 +145,7 @@ def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, 
             pass
     return unified
 
-def create_cut_result(body, params, doc=None, vis_cut_wing=False, vis_centre_lines=False):
+def create_cut_result(body, params, doc=None, vis_cut_wing=False, vis_centre_lines=False, cutout_faces=None):
     """Returns (cut_shape, rib_center_lines, list_of_valid_rib_solids)"""
     if doc is None:
         doc = FreeCAD.ActiveDocument
@@ -157,11 +157,16 @@ def create_cut_result(body, params, doc=None, vis_cut_wing=False, vis_centre_lin
 
     rib_faces1 = create_rib_faces(lines1, params.plane_normal, params.rib_width)
     rib_faces2 = create_rib_faces(lines2, params.plane_normal, params.rib_width)
-
     rib_solids1 = extrude_rib_faces_to_solids(rib_faces1, params.plane_normal, bb)
     rib_solids2 = extrude_rib_faces_to_solids(rib_faces2, params.plane_normal, bb)
     all_rib_solids = rib_solids1 + rib_solids2
 
+    # Apply holes if any cutout faces are provided
+    if cutout_faces:
+        all_rib_solids = apply_holes_to_ribs(all_rib_solids, cutout_faces,
+                                             params.rib_width, params.plane_normal, doc)
+
+    # Filter ribs that intersect the wing
     valid_ribs = []
     for rib in all_rib_solids:
         try:
@@ -176,14 +181,11 @@ def create_cut_result(body, params, doc=None, vis_cut_wing=False, vis_centre_lin
         raise ValueError("No rib solids significantly intersect the wing.")
 
     def fuse_list(lst):
-        if not lst:
-            return None
+        if not lst: return None
         f = lst[0]
         for s in lst[1:]:
-            try:
-                f = f.fuse(s)
-            except Exception:
-                pass
+            try: f = f.fuse(s)
+            except: pass
         return f
 
     fused_ribs = fuse_list(valid_ribs)
@@ -618,3 +620,50 @@ def cutouts_from_segmens(rib_centre_segments, doc, vis, margin):
         from viz_utils import show_rect_cutouts
         show_rect_cutouts(cutouts, doc, color=(1.0,0.5,0.0), transparency=30)
     return cutouts
+
+def apply_holes_to_ribs(rib_solids, cutout_faces, rib_width, plane_normal, doc=None):
+    """
+    For each cutout face (planar, on the rib centre surface), extrude it along the rib normal
+    by rib_width to create a solid hole, then subtract that hole from the corresponding rib solid.
+    Returns a list of holed rib solids (same length as rib_solids, possibly with empty ones).
+    """
+    if not cutout_faces or not rib_solids:
+        return rib_solids
+
+    # Pre‑compute rib normals from centre lines (we need them to orient the extrusion)
+    # We don't have centre lines here, so we assume the cutout face normal is already
+    # the rib normal (face lies on the mid‑plane, its normal = rib normal).
+    holes_compounds = []
+    for hole_face in cutout_faces:
+        # Extrude the face by rib_width along its normal (which is the rib normal)
+        normal = hole_face.normalAt(0.5, 0.5).normalize()
+        extrude_vec = normal * (rib_width * 1.05)  # slightly longer to ensure through‑cut
+        try:
+            hole_solid = hole_face.extrude(extrude_vec)
+            if not hole_solid.isNull():
+                holes_compounds.append(hole_solid)
+        except:
+            continue
+
+    if not holes_compounds:
+        return rib_solids
+
+    # Fuse all hole solids into one compound (or fuse them for cutting)
+    # We will cut each rib individually; easier: for each rib, subtract the hole that lies inside it.
+    # Since cutout faces correspond to specific rib segments, but we don't have direct mapping,
+    # we can simply subtract the whole compound from each rib. This works because a hole only
+    # intersects its own rib; other ribs are not affected (their common volume is zero).
+    holed_ribs = []
+    for rib in rib_solids:
+        try:
+            # Cut the rib with the entire hole compound
+            cut_rib = rib.cut(holes_compounds[0])
+            for h in holes_compounds[1:]:
+                cut_rib = cut_rib.cut(h)
+            if cut_rib.isNull():
+                holed_ribs.append(rib)
+            else:
+                holed_ribs.append(cut_rib)
+        except:
+            holed_ribs.append(rib)
+    return holed_ribs
