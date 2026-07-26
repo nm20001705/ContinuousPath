@@ -8,65 +8,7 @@ import sys
 import FreeCAD
 import time
 import sys
-
-class FreeCADProfiler:
-    """FreeCAD-friendly performance profiler without external dependencies."""
-    def __init__(self):
-        self.operation_stack = []
-        self.enabled = True  # Always enable for profiling
-
-    def log_op(self, name: str, level: int = 0):
-        """Start timing a new operation"""
-        if not self.enabled:
-            return
-
-        # End any previous operation
-        if self.operation_stack:
-            prev_name, prev_start = self.operation_stack[-1]
-            duration = time.time() - prev_start
-            prefix = "  " * (level - 1)
-            sys.stdout.write(f"{prefix}--> {prev_name} completed in {duration:.2f}s\n")
-            sys.stdout.flush()
-
-        # Start new operation
-        self.operation_stack.append((name, time.time()))
-        prefix = "  " * level
-        sys.stdout.write(f"{prefix}Starting: {name}\n")
-        sys.stdout.flush()
-
-    def end_op(self, obj_count: int = 0):
-        """End current operation with object count"""
-        if not self.enabled or not self.operation_stack:
-            return
-
-        name, start_time = self.operation_stack.pop()
-        duration = time.time() - start_time
-        prefix = "  " * len(self.operation_stack)
-
-        if obj_count > 0:
-            sys.stdout.write(f"{prefix}✓ {name} completed in {duration:.2f}s ({obj_count} objects)\n")
-        else:
-            sys.stdout.write(f"{prefix}✅ {name} completed in {duration:.2f}s\n")
-        sys.stdout.flush()
-
-    def log(self, msg: str, level: int = 0):
-        """Simple log message with indentation"""
-        if not self.enabled:
-            return
-        prefix = "  " * level
-        sys.stdout.write(f"{prefix}📝 {msg}\n")
-        sys.stdout.flush()
-
-# Global profiler instance
-profiler = FreeCADProfiler()
-
-# Convenience aliases
-log = profiler.log  # Simple log message
-start_op = profiler.log_op  # Start timing an operation
-end_op = profiler.end_op  # End timing an operation
-start_group = profiler.log_op  # Alias for start_op (indented start)
-end_group = profiler.end_op  # Alias for end_op (indented end)
-log_op = profiler.log  # Alias for simple logging (matches old interface)
+from perf_utils import timed
 
 def rotate_vector_around(v, axis, angle_rad):
     c, s = math.cos(angle_rad), math.sin(angle_rad)
@@ -80,8 +22,8 @@ def rotate_vector_around(v, axis, angle_rad):
         v.z*c + cross.z*s + axis.z*dot*(1-c)
     )
 
+@timed
 def create_angled_grid_lines(bb, params):
-    start_group("Grid Line Generation", level=0)
     n, au, av = params.plane_normal, params.plane_axis_u, params.plane_axis_v
     corners = [
         FreeCAD.Vector(bb.XMin, bb.YMin, bb.ZMin),
@@ -132,12 +74,9 @@ def create_angled_grid_lines(bb, params):
         return lines
     lines1 = generate_lines(d1)
     lines2 = generate_lines(d2)
-    log_op(f"Generated {len(lines1)} + {len(lines2)} = {len(lines1)+len(lines2)} grid lines", level=1)
-    end_op(len(lines1) + len(lines2))
     return lines1, lines2
 
 def create_rib_faces(lines, plane_normal, rib_width):
-    start_group("Rib Face Creation", level=1)
     half_w = rib_width / 2.0
     faces = []
     for line in lines:
@@ -153,12 +92,9 @@ def create_rib_faces(lines, plane_normal, rib_width):
             faces.append(Part.Face(wire))
         except Exception:
             pass
-    log(f"📊 Created {len(faces)} rib faces", level=1)
-    end_op(len(faces))
     return faces
 
 def extrude_rib_faces_to_solids(faces, plane_normal, bb):
-    start_group("Rib Solid Extrusion", level=1)
     n = plane_normal.normalize()
     def dot(v, a): return v.x*a.x + v.y*a.y + v.z*a.z
     corners = [FreeCAD.Vector(bb.XMin, bb.YMin, bb.ZMin),
@@ -177,12 +113,9 @@ def extrude_rib_faces_to_solids(faces, plane_normal, bb):
             solids.append(f.extrude(extrude_vec))
         except Exception:
             continue
-    log(f"📊 Extruded {len(solids)} rib solids", level=1)
-    end_op(len(solids))
     return solids
 
 def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, bridge_size=None):
-    start_group("Bridge Generation", level=1)
     if bridge_size is None:
         bridge_size = rib_width * 0.5
     if cut_body.ShapeType in ("Compound", "CompSolid"):
@@ -211,8 +144,6 @@ def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, 
         box.Placement = FreeCAD.Placement(mid, rot)
         bridges.append(box)
     if not bridges:
-        log("📊 No bridges created", level=1)
-        end_op()
         return cut_body
     all_parts = solids + bridges
     unified = all_parts[0]
@@ -221,19 +152,18 @@ def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, 
             unified = unified.fuse(p)
         except Exception:
             pass
-    log(f"📊 Created {len(bridges)} bridges", level=1)
-    end_op()
     return unified
 
-def create_cut_result(body, params, doc=None, vis_cut_wing=False, vis_centre_lines=False, cutout_faces=None):
-    """Returns (cut_shape, rib_center_lines, list_of_valid_rib_solids)"""
-    start_group("Cut Result Generation", level=0)
+@timed
+def create_cut_result_mesh(wing_mesh, params, doc=None, lines1=None, lines2=None):
+    """Returns (cut_mesh, rib_center_lines) using mesh booleans."""
     if doc is None:
         doc = FreeCAD.ActiveDocument
-    raw_shape = body.Shape if hasattr(body, "Shape") else body
-    bb = raw_shape.BoundBox
+    bb = wing_mesh.BoundBox
 
-    lines1, lines2 = create_angled_grid_lines(bb, params)
+    # 1. Generate rib solids (same as before)
+    if lines1 is None or lines2 is None:
+        lines1, lines2 = create_angled_grid_lines(bb, params)
     all_center_lines = lines1 + lines2
 
     rib_faces1 = create_rib_faces(lines1, params.plane_normal, params.rib_width)
@@ -242,51 +172,27 @@ def create_cut_result(body, params, doc=None, vis_cut_wing=False, vis_centre_lin
     rib_solids2 = extrude_rib_faces_to_solids(rib_faces2, params.plane_normal, bb)
     all_rib_solids = rib_solids1 + rib_solids2
 
-    # Apply holes if any cutout faces are provided
-    if cutout_faces:
-        all_rib_solids = apply_holes_to_ribs(all_rib_solids, cutout_faces,
-                                             params.rib_width, params.plane_normal, doc)
-
-    # Filter ribs that intersect the wing
-    valid_ribs = []
+    # 2. Convert each rib solid to a mesh and fuse them
+    rib_meshes = []
     for rib in all_rib_solids:
         try:
-            common = rib.common(raw_shape)
-            if common is None or common.Volume < 1.0:
-                continue
-            valid_ribs.append(rib)
-        except Exception:
+            m = solid_to_mesh(rib)
+            if m and m.Facets:
+                rib_meshes.append(m)
+        except:
             continue
+    if not rib_meshes:
+        return wing_mesh, all_center_lines
 
-    if not valid_ribs:
-        raise ValueError("No rib solids significantly intersect the wing.")
+    # Fuse all rib meshes into one
+    rib_mesh = rib_meshes[0]
+    for m in rib_meshes[1:]:
+        rib_mesh = rib_mesh.fuse(m)
 
-    def fuse_list(lst):
-        if not lst:
-            return None
-        f = lst[0]
-        for s in lst[1:]:
-            try:
-                f = f.fuse(s)
-            except:
-                pass
-        return f
+    # 3. Subtract the rib mesh from the wing mesh
+    cut_mesh = wing_mesh.difference(rib_mesh)
 
-    fused_ribs = fuse_list(valid_ribs)
-    log(f"📊 Fusing {len(valid_ribs)} valid ribs", level=1)
-    cut_result = raw_shape.cut(fused_ribs)
-
-    if vis_cut_wing:
-        from viz_utils import show_cut_wing
-        show_cut_wing(cut_result, doc, transparency=80)
-
-    if vis_centre_lines:
-        from viz_utils import show_rib_centre_lines
-        show_rib_centre_lines(all_center_lines, doc)
-
-    log(f"✅ Cut result created", level=1)
-    end_op()
-    return cut_result, all_center_lines, valid_ribs
+    return cut_mesh, all_center_lines
 
 def generate_final_solid(body, params, doc=None, add_bridges=True):
     """Returns the final solid (cut + bridges)"""
@@ -303,7 +209,7 @@ def generate_final_solid(body, params, doc=None, add_bridges=True):
         doc.recompute()
     return result
 
-
+@timed
 def merge_and_show_final(cut_result, bridges_shape, doc, vis=True):
     """
     Fuse the cut wing with the bridges shape.
@@ -318,35 +224,53 @@ def merge_and_show_final(cut_result, bridges_shape, doc, vis=True):
         show_final_solid(final, doc)
     return final
 
-def create_rib_centre_surfaces(wing_shape, rib_center_lines, plane_normal, doc, vis=False, tol=1e-4):
+@timed
+
+def create_rib_centre_surfaces(wing_shape, rib_center_lines, plane_normal, doc, vis=False, tol=1e-3):
     """
     Returns (faces, edges).
-    faces: list of Part.Face — one for each closed region (including holes)
-    edges: list of Part.Edge — all raw intersection edges
+    faces: list of Part.Face — one for each rib surface (if face creation succeeds).
+    edges: list of Part.Edge — all raw intersection edges (always returned).
     """
     faces = []
     all_edges = []
+    wing_bb = wing_shape.BoundBox
 
     for line in rib_center_lines:
         start = line.Vertexes[0].Point
         end   = line.Vertexes[-1].Point
+
+        # Quick bounding box check using FreeCAD.BoundBox
+        xmin, xmax = min(start.x, end.x), max(start.x, end.x)
+        ymin, ymax = min(start.y, end.y), max(start.y, end.y)
+        zmin, zmax = min(start.z, end.z), max(start.z, end.z)
+        line_bb = FreeCAD.BoundBox(xmin, ymin, zmin, xmax, ymax, zmax)
+        if not line_bb.intersect(wing_bb):
+            continue
+
         rib_dir = (end - start).normalize()
         n_rib = rib_dir.cross(plane_normal).normalize()
         plane = Part.Plane(start, n_rib)
+
         try:
-            intersect = wing_shape.section(plane)
+            # Try makeCrossSection (if available)
+            try:
+                intersect = wing_shape.makeCrossSection(plane, tol)
+            except AttributeError:
+                # Fallback to section
+                intersect = wing_shape.section(plane)
+
             if not intersect or not intersect.Edges:
                 continue
             edges = list(intersect.Edges)
             all_edges.extend(edges)
 
-            # ---- Build all closed wires by edge stitching ----
+            # ---- Stitch edges into wires ----
             used = [False] * len(edges)
             wires = []
             for i in range(len(edges)):
                 if used[i]:
                     continue
-                # Start a new wire
                 loop = [edges[i]]
                 used[i] = True
                 cur_end = edges[i].Vertexes[-1].Point
@@ -370,7 +294,6 @@ def create_rib_centre_surfaces(wing_shape, rib_center_lines, plane_normal, doc, 
                             cur_end = e.Vertexes[0].Point
                             changed = True
                             break
-                # Close the wire
                 if len(loop) > 1:
                     try:
                         wire = Part.Wire(loop)
@@ -378,31 +301,34 @@ def create_rib_centre_surfaces(wing_shape, rib_center_lines, plane_normal, doc, 
                     except:
                         continue
 
-            # For each closed wire, create a face. We will not attempt to detect nesting; just create faces.
-            # If there is nesting, some faces may be holes, but they will be separate objects.
-            # That's acceptable for visualisation and further processing.
-            for wire in wires:
-                if wire.isClosed() and not wire.isNull():
-                    try:
-                        face = Part.Face(wire)
-                        if face.isValid():
-                            faces.append(face)
-                    except:
-                        # Fallback: try to create face with tolerance
-                        try:
-                            face = Part.Face(wire, tolerance=tol)
-                            if face.isValid():
-                                faces.append(face)
-                        except:
-                            continue
+            if not wires:
+                continue
+
+            # Select the wire with largest area (outer boundary)
+            outer_wire = max(wires, key=lambda w: abs(w.Area))
+            try:
+                face = Part.Face(outer_wire)
+                if face.isValid():
+                    faces.append(face)
+            except:
+                # Fallback: try to create face with tolerance
+                try:
+                    face = Part.Face(outer_wire, tolerance=tol)
+                    if face.isValid():
+                        faces.append(face)
+                except:
+                    continue
+
         except Exception:
             continue
+
     if vis:
         from viz_utils import show_rib_centre_surfaces, show_rib_centre_edges
         show_rib_centre_surfaces(faces, doc, color=(0.8, 0.4, 0.8), transparency=50)
         print(f"Created {len(faces)} rib centre surfaces.")
-        show_rib_centre_edges(edges, doc, line_color=(0.2, 0.5, 1.0), line_width=2)
-        print(f"Created {len(edges)} rib centre edges.")
+        show_rib_centre_edges(all_edges, doc, line_color=(0.2, 0.5, 1.0), line_width=2)
+        print(f"Created {len(all_edges)} rib centre edges.")
+
     return faces, all_edges
 
 def _lines_intersect_3d(p1, d1, p2, d2, tol=1.0):
@@ -440,85 +366,88 @@ def _lines_intersect_3d(p1, d1, p2, d2, tol=1.0):
         return cp1  # intersection point (approximately)
     return None
 
-def split_rib_faces_by_crossings(rib_faces, rib_center_lines, doc, viz_params, tol=1e-4, rib_width=None):
+@timed
+def split_rib_faces_by_crossings(rib_faces, doc, viz_params, tol=1e-4, min_area=0.1):
     """
-    Optimized version with spatial filtering to avoid O(n²) checks.
+    Optimized version: only cut faces with area > min_area and from different families.
     """
     n = len(rib_faces)
     if n == 0:
         return []
 
-    # Get rib_width from parameters (or use tol as fallback)
-    rib_width = rib_width if rib_width is not None else tol
-
-    # Precompute bounding boxes for spatial filtering
-    bboxes = [face.BoundBox for face in rib_faces]
-
-    # Sort faces by X-center coordinate
-    face_centers_x = [(bbox.XMin + bbox.XMax) * 0.5 for bbox in bboxes]
-    sorted_indices = sorted(range(n), key=lambda i: face_centers_x[i])
-    sorted_faces = [rib_faces[i] for i in sorted_indices]
-    sorted_bboxes = [bboxes[i] for i in sorted_indices]
+    # Pre‑compute normals, bounding boxes, and areas
+    normals = []
+    bboxes = []
+    areas = []
+    for face in rib_faces:
+        try:
+            normal = face.normalAt(0.5, 0.5).normalize()
+        except:
+            normal = FreeCAD.Vector(0,0,1)
+        normals.append(normal)
+        bboxes.append(face.BoundBox)
+        areas.append(face.Area)
 
     all_pieces = []
+    cut_count = 0
+    skip_small_count = 0
+    skip_parallel_count = 0
+    skip_bbox_count = 0
+    candidate_checks = 0
 
     for i in range(n):
-        face = sorted_faces[i]
-        bbox_i = sorted_bboxes[i]
-        center_x_i = face_centers_x[i]
+        face_i = rib_faces[i]
+        # Skip tiny faces – they won't contain a cutout
+        if areas[i] < min_area:
+            skip_small_count += 1
+            all_pieces.append(face_i)
+            continue
 
-        # Spatial pruning: only check within X-range ± rib_width
-        start_j = i + 1
-        # Find faces that could potentially overlap in X
-        end_j = n
-        for j in range(i + 1, n):
-            if sorted_bboxes[j].XMin > bbox_i.XMax:  # No overlap possible
-                break
-            end_j = j + 1
+        bbox_i = bboxes[i]
+        normal_i = normals[i]
 
         candidates = []
-        for j in range(start_j, end_j):
-            bbox_j = sorted_bboxes[j]
-            # Quick bounding box check
-            if bbox_i.intersect(bbox_j):
-                # Verify actual intersection before expensive cut
-                try:
-                    section = face.section(sorted_faces[j])
-                    if section.isNull() or not section.Edges:
-                        continue  # No intersection
-                except Exception:
-                    continue  # Skip on error
-                candidates.append(sorted_faces[j])
+        for j in range(n):
+            if i == j:
+                continue
+            candidate_checks += 1
+            # Skip same family (parallel normals)
+            if abs(normal_i.dot(normals[j])) > 0.9:
+                skip_parallel_count += 1
+                continue
+            if not bbox_i.intersect(bboxes[j]):
+                skip_bbox_count += 1
+                continue
+            candidates.append(j)
 
         if candidates:
-            # Batch cut: fuse all candidates into one tool
-            cut_tool = candidates[0]
-            for c in candidates[1:]:
+            cut_tool = rib_faces[candidates[0]]
+            for j in candidates[1:]:
                 try:
-                    cut_tool = cut_tool.fuse(c)
-                except Exception:
-                    pass  # Skip problematic fusions
-
+                    cut_tool = cut_tool.fuse(rib_faces[j])
+                except:
+                    pass
             try:
-                result = face.cut(cut_tool)
+                result = face_i.cut(cut_tool)
+                cut_count += 1
                 if not result.isNull():
-                    # Extract valid faces from result
                     faces_out = result.Faces if hasattr(result, 'Faces') else [result]
-                    valid_faces = [f for f in faces_out
-                                 if f is not None and not f.isNull() and f.Area > tol]
-                    if valid_faces:
-                        all_pieces.extend(valid_faces)
+                    valid = [f for f in faces_out if f is not None and not f.isNull() and f.Area > tol]
+                    if valid:
+                        all_pieces.extend(valid)
                     else:
-                        all_pieces.append(face)  # Keep original if cut produced nothing valid
-            except Exception:
-                all_pieces.append(face)  # Keep original on error
+                        all_pieces.append(face_i)
+                else:
+                    all_pieces.append(face_i)
+            except:
+                all_pieces.append(face_i)
         else:
-            all_pieces.append(face)  # No candidates, keep original
+            all_pieces.append(face_i)
+
 
     if viz_params:
         from viz_utils import show_rib_segments
         show_rib_segments(all_pieces, doc)
-
     return all_pieces
 
 def create_rectangular_cutout_from_boundary(face, margin=1.0):
@@ -643,6 +572,7 @@ def create_rectangular_cutout_from_boundary(face, margin=1.0):
     else:
         return process_single_face(face, margin)
 
+@timed
 def cutouts_from_segmens(rib_centre_segments, doc, vis, margin):
     cutouts = []
     for seg in rib_centre_segments:
@@ -655,22 +585,19 @@ def cutouts_from_segmens(rib_centre_segments, doc, vis, margin):
     return cutouts
 
 def apply_holes_to_ribs(rib_solids, cutout_faces, rib_width, plane_normal, doc=None):
-    """
-    For each cutout face, create a hole solid that spans the entire rib thickness
-    (centered on the face), then subtract it from the corresponding rib solid.
-    """
+    import time
     if not cutout_faces or not rib_solids:
         return rib_solids
 
+    # 1. Create hole solids
+    t0 = time.time()
     holes = []
     for face in cutout_faces:
         normal = face.normalAt(0.5, 0.5).normalize()
         half = rib_width / 2.0
-        # Move face backward by half thickness
         moved = face.copy()
         moved.translate(normal * (-half))
         try:
-            # Extrude forward by full thickness
             solid = moved.extrude(normal * rib_width)
             if not solid.isNull():
                 holes.append(solid)
@@ -680,14 +607,16 @@ def apply_holes_to_ribs(rib_solids, cutout_faces, rib_width, plane_normal, doc=N
     if not holes:
         return rib_solids
 
-    # Fuse all hole solids into one cutting tool
+    # 2. Fuse holes
+    t0 = time.time()
     cutter = holes[0]
     for h in holes[1:]:
         cutter = cutter.fuse(h)
 
-    # Subtract the combined holes from each rib
+    # 3. Cut each rib
+    t0 = time.time()
     holed = []
-    for rib in rib_solids:
+    for i, rib in enumerate(rib_solids):
         try:
             cut_rib = rib.cut(cutter)
             if cut_rib.isNull():
@@ -696,4 +625,5 @@ def apply_holes_to_ribs(rib_solids, cutout_faces, rib_width, plane_normal, doc=N
                 holed.append(cut_rib)
         except:
             holed.append(rib)
+
     return holed

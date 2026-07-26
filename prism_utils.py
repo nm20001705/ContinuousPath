@@ -2,6 +2,8 @@
 import FreeCAD
 import Part
 
+from perf_utils import timed
+
 def extend_rib_wire(pts_sorted, extend_len):
     """Extend the first and last segment outward, return new list with two extra points."""
     if len(pts_sorted) < 2:
@@ -12,6 +14,7 @@ def extend_rib_wire(pts_sorted, extend_len):
     p_after = pts_sorted[-1] + dir_last * extend_len
     return [p_before] + pts_sorted + [p_after]
 
+@timed
 def create_bridges_trimmed_to_wing(data_by_rib, rib_center_lines, plane_normal,
                                    rib_width, bridge_height, wing_shape,
                                    extend_length=5.0, doc=None, vis=False):
@@ -22,6 +25,11 @@ def create_bridges_trimmed_to_wing(data_by_rib, rib_center_lines, plane_normal,
     if doc is None:
         doc = FreeCAD.ActiveDocument
 
+    # Quick exit if no data
+    if not data_by_rib or not any(v['mid'] for v in data_by_rib.values()):
+        print("No bridge points – skipping bridge generation.")
+        return None
+
     # Pre‑compute rib normals from centre lines
     rib_normals = []
     for line in rib_center_lines:
@@ -31,7 +39,10 @@ def create_bridges_trimmed_to_wing(data_by_rib, rib_center_lines, plane_normal,
         n_rib = rib_dir.cross(plane_normal).normalize()
         rib_normals.append(n_rib)
 
-    all_bridges = []
+    all_bridges = []  # collect all trimmed bridge solids
+    total_segments = 0
+    total_prisms = 0
+    ribs_with_bridges = 0
 
     for idx, data in data_by_rib.items():
         pts = data['mid']
@@ -39,6 +50,7 @@ def create_bridges_trimmed_to_wing(data_by_rib, rib_center_lines, plane_normal,
             continue
         pts_sorted = sorted(pts, key=lambda p: p.z)
         pts_extended = extend_rib_wire(pts_sorted, extend_length)
+        total_segments += len(pts_extended) - 1
 
         n_rib = rib_normals[idx]
         ext_dir = plane_normal.normalize()
@@ -49,7 +61,6 @@ def create_bridges_trimmed_to_wing(data_by_rib, rib_center_lines, plane_normal,
         for i in range(len(pts_extended)-1):
             p1 = pts_extended[i]
             p2 = pts_extended[i+1]
-
             offs = [
                 ( half_w,  half_h),
                 ( half_w, -half_h),
@@ -60,13 +71,11 @@ def create_bridges_trimmed_to_wing(data_by_rib, rib_center_lines, plane_normal,
             v2 = [p2 + n_rib * w + ext_dir * h for (w, h) in offs]
 
             faces = []
-            # side faces
             for j in range(4):
                 k = (j+1) % 4
                 verts = [v1[j], v2[j], v2[k], v1[k]]
                 wire = Part.makePolygon(verts + [verts[0]])
                 faces.append(Part.Face(wire))
-            # end caps
             wire1 = Part.makePolygon(v1 + [v1[0]])
             faces.append(Part.Face(wire1))
             wire2 = Part.makePolygon(v2 + [v2[0]])
@@ -78,29 +87,35 @@ def create_bridges_trimmed_to_wing(data_by_rib, rib_center_lines, plane_normal,
                     solid = Part.makeSolid(shell)
                     if not solid.isNull():
                         seg_prisms.append(solid)
-            except Exception as e:
-                print(f"Error in segment {i} of rib {idx}: {e}")
+                        total_prisms += 1
+            except Exception:
+                continue
 
         if seg_prisms:
             # Fuse all segments of this rib into one solid
             fused = seg_prisms[0]
             for pr in seg_prisms[1:]:
-                fused = fused.fuse(pr)
+                try:
+                    fused = fused.fuse(pr)
+                except:
+                    pass
 
             # Trim the extended bridge to the wing shape
             try:
                 trimmed = fused.common(wing_shape)
                 if not trimmed.isNull() and trimmed.Volume > 1e-6:
                     all_bridges.append(trimmed)
-            except Exception as e:
-                print(f"Intersection failed for rib {idx}: {e}")
+                    ribs_with_bridges += 1
+            except Exception:
+                continue
+
 
     if all_bridges:
         compound = Part.Compound(all_bridges)
         if vis:
             from viz_utils import show_bridges
             show_bridges(compound, doc)
-        return compound   # return the shape, not an object
+        return compound
     else:
         print("No bridges created.")
         return None
