@@ -623,47 +623,44 @@ def cutouts_from_segmens(rib_centre_segments, doc, vis, margin):
 
 def apply_holes_to_ribs(rib_solids, cutout_faces, rib_width, plane_normal, doc=None):
     """
-    For each cutout face (planar, on the rib centre surface), extrude it along the rib normal
-    by rib_width to create a solid hole, then subtract that hole from the corresponding rib solid.
-    Returns a list of holed rib solids (same length as rib_solids, possibly with empty ones).
+    For each cutout face, create a hole solid that spans the entire rib thickness
+    (centered on the face), then subtract it from the corresponding rib solid.
     """
     if not cutout_faces or not rib_solids:
         return rib_solids
 
-    # Pre‑compute rib normals from centre lines (we need them to orient the extrusion)
-    # We don't have centre lines here, so we assume the cutout face normal is already
-    # the rib normal (face lies on the mid‑plane, its normal = rib normal).
-    holes_compounds = []
-    for hole_face in cutout_faces:
-        # Extrude the face by rib_width along its normal (which is the rib normal)
-        normal = hole_face.normalAt(0.5, 0.5).normalize()
-        extrude_vec = normal * (rib_width * 1.05)  # slightly longer to ensure through‑cut
+    holes = []
+    for face in cutout_faces:
+        normal = face.normalAt(0.5, 0.5).normalize()
+        half = rib_width / 2.0
+        # Move face backward by half thickness
+        moved = face.copy()
+        moved.translate(normal * (-half))
         try:
-            hole_solid = hole_face.extrude(extrude_vec)
-            if not hole_solid.isNull():
-                holes_compounds.append(hole_solid)
+            # Extrude forward by full thickness
+            solid = moved.extrude(normal * rib_width)
+            if not solid.isNull():
+                holes.append(solid)
         except:
             continue
 
-    if not holes_compounds:
+    if not holes:
         return rib_solids
 
-    # Fuse all hole solids into one compound (or fuse them for cutting)
-    # We will cut each rib individually; easier: for each rib, subtract the hole that lies inside it.
-    # Since cutout faces correspond to specific rib segments, but we don't have direct mapping,
-    # we can simply subtract the whole compound from each rib. This works because a hole only
-    # intersects its own rib; other ribs are not affected (their common volume is zero).
-    holed_ribs = []
+    # Fuse all hole solids into one cutting tool
+    cutter = holes[0]
+    for h in holes[1:]:
+        cutter = cutter.fuse(h)
+
+    # Subtract the combined holes from each rib
+    holed = []
     for rib in rib_solids:
         try:
-            # Cut the rib with the entire hole compound
-            cut_rib = rib.cut(holes_compounds[0])
-            for h in holes_compounds[1:]:
-                cut_rib = cut_rib.cut(h)
+            cut_rib = rib.cut(cutter)
             if cut_rib.isNull():
-                holed_ribs.append(rib)
+                holed.append(rib)
             else:
-                holed_ribs.append(cut_rib)
+                holed.append(cut_rib)
         except:
-            holed_ribs.append(rib)
-    return holed_ribs
+            holed.append(rib)
+    return holed

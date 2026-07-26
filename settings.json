@@ -1,0 +1,5 @@
+{
+    "python.analysis.extraPaths": [
+        "C:/Program Files/FreeCAD 1.1/bin"
+    ]
+}
