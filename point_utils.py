@@ -278,7 +278,7 @@ def collect_rib_midpoints(wing_shape, rib_center_lines, plane_normal, z_min, z_m
 
     total_mid = sum(len(v['mid']) for v in data_by_rib.values())
     total_edge = sum(len(v['edge_cases']) for v in data_by_rib.values())
-    print(f"Collected {total_mid} midpoints (including merged edge cases) and {total_edge} raw edge‑case points over {slice_count} slices.")
+    print(f"Collected {total_mid} midpoints over {slice_count} slices.")
     if vis:
         all_points = []
         for data in data_by_rib.values():

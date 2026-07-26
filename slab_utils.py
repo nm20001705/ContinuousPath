@@ -2,7 +2,71 @@
 import FreeCAD
 import Part
 import math
-import random
+import sys
+
+# ===== FreeCAD Profiler Helper =====
+import FreeCAD
+import time
+import sys
+
+class FreeCADProfiler:
+    """FreeCAD-friendly performance profiler without external dependencies."""
+    def __init__(self):
+        self.operation_stack = []
+        self.enabled = True  # Always enable for profiling
+
+    def log_op(self, name: str, level: int = 0):
+        """Start timing a new operation"""
+        if not self.enabled:
+            return
+
+        # End any previous operation
+        if self.operation_stack:
+            prev_name, prev_start = self.operation_stack[-1]
+            duration = time.time() - prev_start
+            prefix = "  " * (level - 1)
+            sys.stdout.write(f"{prefix}➡️ {prev_name} completed in {duration:.2f}s\n")
+            sys.stdout.flush()
+
+        # Start new operation
+        self.operation_stack.append((name, time.time()))
+        prefix = "  " * level
+        sys.stdout.write(f"{prefix}🔍 Starting: {name}\n")
+        sys.stdout.flush()
+
+    def end_op(self, obj_count: int = 0):
+        """End current operation with object count"""
+        if not self.enabled or not self.operation_stack:
+            return
+
+        name, start_time = self.operation_stack.pop()
+        duration = time.time() - start_time
+        prefix = "  " * len(self.operation_stack)
+
+        if obj_count > 0:
+            sys.stdout.write(f"{prefix}✅ {name} completed in {duration:.2f}s ({obj_count} objects)\n")
+        else:
+            sys.stdout.write(f"{prefix}✅ {name} completed in {duration:.2f}s\n")
+        sys.stdout.flush()
+
+    def log(self, msg: str, level: int = 0):
+        """Simple log message with indentation"""
+        if not self.enabled:
+            return
+        prefix = "  " * level
+        sys.stdout.write(f"{prefix}📝 {msg}\n")
+        sys.stdout.flush()
+
+# Global profiler instance
+profiler = FreeCADProfiler()
+
+# Convenience aliases
+log = profiler.log  # Simple log message
+start_op = profiler.log_op  # Start timing an operation
+end_op = profiler.end_op  # End timing an operation
+start_group = profiler.log_op  # Alias for start_op (indented start)
+end_group = profiler.end_op  # Alias for end_op (indented end)
+log_op = profiler.log  # Alias for simple logging (matches old interface)
 
 def rotate_vector_around(v, axis, angle_rad):
     c, s = math.cos(angle_rad), math.sin(angle_rad)
@@ -17,6 +81,7 @@ def rotate_vector_around(v, axis, angle_rad):
     )
 
 def create_angled_grid_lines(bb, params):
+    start_group("Grid Line Generation", level=0)
     n, au, av = params.plane_normal, params.plane_axis_u, params.plane_axis_v
     corners = [
         FreeCAD.Vector(bb.XMin, bb.YMin, bb.ZMin),
@@ -65,9 +130,14 @@ def create_angled_grid_lines(bb, params):
             end   = FreeCAD.Vector(p0.x + d.x*line_len, p0.y + d.y*line_len, p0.z + d.z*line_len)
             lines.append(Part.makeLine(start, end))
         return lines
-    return generate_lines(d1), generate_lines(d2)
+    lines1 = generate_lines(d1)
+    lines2 = generate_lines(d2)
+    log_op(f"Generated {len(lines1)} + {len(lines2)} = {len(lines1)+len(lines2)} grid lines", level=1)
+    end_op(len(lines1) + len(lines2))
+    return lines1, lines2
 
 def create_rib_faces(lines, plane_normal, rib_width):
+    start_group("Rib Face Creation", level=1)
     half_w = rib_width / 2.0
     faces = []
     for line in lines:
@@ -81,11 +151,14 @@ def create_rib_faces(lines, plane_normal, rib_width):
             p4 = end + perp
             wire = Part.makePolygon([p1, p2, p3, p4, p1])
             faces.append(Part.Face(wire))
-        except:
+        except Exception:
             pass
+    log(f"📊 Created {len(faces)} rib faces", level=1)
+    end_op(len(faces))
     return faces
 
 def extrude_rib_faces_to_solids(faces, plane_normal, bb):
+    start_group("Rib Solid Extrusion", level=1)
     n = plane_normal.normalize()
     def dot(v, a): return v.x*a.x + v.y*a.y + v.z*a.z
     corners = [FreeCAD.Vector(bb.XMin, bb.YMin, bb.ZMin),
@@ -102,11 +175,14 @@ def extrude_rib_faces_to_solids(faces, plane_normal, bb):
             f = face.copy()
             f.translate(n * shift)
             solids.append(f.extrude(extrude_vec))
-        except:
+        except Exception:
             continue
+    log(f"📊 Extruded {len(solids)} rib solids", level=1)
+    end_op(len(solids))
     return solids
 
 def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, bridge_size=None):
+    start_group("Bridge Generation", level=1)
     if bridge_size is None:
         bridge_size = rib_width * 0.5
     if cut_body.ShapeType in ("Compound", "CompSolid"):
@@ -135,18 +211,23 @@ def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, 
         box.Placement = FreeCAD.Placement(mid, rot)
         bridges.append(box)
     if not bridges:
+        log("📊 No bridges created", level=1)
+        end_op()
         return cut_body
     all_parts = solids + bridges
     unified = all_parts[0]
     for p in all_parts[1:]:
         try:
             unified = unified.fuse(p)
-        except:
+        except Exception:
             pass
+    log(f"📊 Created {len(bridges)} bridges", level=1)
+    end_op()
     return unified
 
 def create_cut_result(body, params, doc=None, vis_cut_wing=False, vis_centre_lines=False, cutout_faces=None):
     """Returns (cut_shape, rib_center_lines, list_of_valid_rib_solids)"""
+    start_group("Cut Result Generation", level=0)
     if doc is None:
         doc = FreeCAD.ActiveDocument
     raw_shape = body.Shape if hasattr(body, "Shape") else body
@@ -181,14 +262,18 @@ def create_cut_result(body, params, doc=None, vis_cut_wing=False, vis_centre_lin
         raise ValueError("No rib solids significantly intersect the wing.")
 
     def fuse_list(lst):
-        if not lst: return None
+        if not lst:
+            return None
         f = lst[0]
         for s in lst[1:]:
-            try: f = f.fuse(s)
-            except: pass
+            try:
+                f = f.fuse(s)
+            except:
+                pass
         return f
 
     fused_ribs = fuse_list(valid_ribs)
+    log(f"📊 Fusing {len(valid_ribs)} valid ribs", level=1)
     cut_result = raw_shape.cut(fused_ribs)
 
     if vis_cut_wing:
@@ -199,6 +284,8 @@ def create_cut_result(body, params, doc=None, vis_cut_wing=False, vis_centre_lin
         from viz_utils import show_rib_centre_lines
         show_rib_centre_lines(all_center_lines, doc)
 
+    log(f"✅ Cut result created", level=1)
+    end_op()
     return cut_result, all_center_lines, valid_ribs
 
 def generate_final_solid(body, params, doc=None, add_bridges=True):

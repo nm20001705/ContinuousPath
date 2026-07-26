@@ -2,7 +2,7 @@ import FreeCAD
 import FreeCADGui
 import Part
 import Mesh
-from slab_utils import create_cut_result, merge_and_show_final, create_rib_centre_surfaces, split_rib_faces_by_crossings, cutouts_from_segmens
+from slab_utils import create_cut_result, merge_and_show_final, create_rib_centre_surfaces, split_rib_faces_by_crossings, cutouts_from_segmens, log_op
 from point_utils import collect_rib_midpoints, create_rib_wires
 from prism_utils import create_bridges_trimmed_to_wing
 from viz_utils import fit_view
@@ -70,7 +70,6 @@ class LWInfillParams:
         self.vis_rect_cutouts = vis_rect_cutouts
         if xy_rib_width:
             self.rib_width = xy_rib_width / math.sin(math.radians(90-rib_angle))
-            print(self.rib_width)
         else:
             self.rib_width = rib_width
 
@@ -108,17 +107,23 @@ def main(params):
 
     # 1. Compute grid lines and centre lines
     from slab_utils import create_angled_grid_lines
+    log_op("Starting pipeline: Grid line generation")
     lines1, lines2 = create_angled_grid_lines(bb, params)
     all_center_lines = lines1 + lines2
+    log_op(f"Generated {len(all_center_lines)} center lines")
 
     # 2. Generate rib centre surfaces and segments
+    log_op("Generating rib centre surfaces")
     rib_centre_surfaces, _ = create_rib_centre_surfaces(wing_shape, all_center_lines, params.plane_normal, doc, vis=params.vis_rib_centre_surfaces)
+    log_op("Splitting rib faces by crossings")
     rib_centre_segments = split_rib_faces_by_crossings(rib_centre_surfaces, doc, vis=params.vis_rib_surface_segments)
 
     # 3. Create cutout faces (rectangular holes)
+    log_op("Creating cutout faces")
     cutout_faces = cutouts_from_segmens(rib_centre_segments, doc, vis=params.vis_rect_cutouts, margin=params.cutout_marging)
 
     # 4. Create cut result with holes (subtract holes from ribs)
+    log_op("Creating cut result with holes")
     cut_result, all_center_lines, valid_ribs = create_cut_result(
         wing_shape, params, doc,
         vis_cut_wing=params.vis_cut_wing,
@@ -127,6 +132,7 @@ def main(params):
     )
 
     # 5. Bridges (midpoints, wires, bridges)
+    log_op("Collecting rib midpoints")
     points_by_rib = collect_rib_midpoints(wing_shape=wing_shape,
                                           rib_center_lines=all_center_lines,
                                           plane_normal=params.plane_normal,
@@ -135,7 +141,9 @@ def main(params):
                                           z_step=params.z_step,
                                           doc=doc,
                                           vis=params.vis_midpoints)
+    log_op("Creating rib wires")
     wires = create_rib_wires(points_by_rib, doc, vis=params.vis_wires)
+    log_op("Generating bridges")
     bridges = create_bridges_trimmed_to_wing(data_by_rib=points_by_rib,
                                              rib_center_lines=all_center_lines,
                                              plane_normal=params.plane_normal,
@@ -147,6 +155,7 @@ def main(params):
                                              vis=params.vis_bridges)
 
     # 6. Final solid
+    log_op("Merging final solid")
     final_solid = merge_and_show_final(cut_result, bridges, doc, vis=params.vis_final_solid)
     if final_solid is None or final_solid.isNull():
         print("Error: final solid is null – cannot proceed.")
@@ -200,9 +209,11 @@ if __name__ == "__main__":
         # input_step_path=r"C:\Users\natha\git\ContinuousPath\.in\test_wing.step",   # set to empty to use FCStd
         # output_stl_path=r"C:\Users\natha\Prints\test_wing\wing-FullGrid.stl",
         # Fallback for FCStd
-        doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\WingR1.FCStd",
+        doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.FCStd",
         # obj_name='Nose001',
-        obj_name='WingR1_msv001_solid',
+        # obj_name='WingR1_msv001_solid',
+        obj_name='Part__Feature_solid',
+        # obj_name='Extrude001',
         # ===== GEOMETRY PARAMETERS =====
         nozzle_diameter=0.4,
         rib_spacing=20.0,
