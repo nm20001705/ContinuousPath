@@ -25,13 +25,13 @@ class FreeCADProfiler:
             prev_name, prev_start = self.operation_stack[-1]
             duration = time.time() - prev_start
             prefix = "  " * (level - 1)
-            sys.stdout.write(f"{prefix}➡️ {prev_name} completed in {duration:.2f}s\n")
+            sys.stdout.write(f"{prefix}--> {prev_name} completed in {duration:.2f}s\n")
             sys.stdout.flush()
 
         # Start new operation
         self.operation_stack.append((name, time.time()))
         prefix = "  " * level
-        sys.stdout.write(f"{prefix}🔍 Starting: {name}\n")
+        sys.stdout.write(f"{prefix}Starting: {name}\n")
         sys.stdout.flush()
 
     def end_op(self, obj_count: int = 0):
@@ -44,7 +44,7 @@ class FreeCADProfiler:
         prefix = "  " * len(self.operation_stack)
 
         if obj_count > 0:
-            sys.stdout.write(f"{prefix}✅ {name} completed in {duration:.2f}s ({obj_count} objects)\n")
+            sys.stdout.write(f"{prefix}✓ {name} completed in {duration:.2f}s ({obj_count} objects)\n")
         else:
             sys.stdout.write(f"{prefix}✅ {name} completed in {duration:.2f}s\n")
         sys.stdout.flush()
@@ -439,141 +439,87 @@ def _lines_intersect_3d(p1, d1, p2, d2, tol=1.0):
     if dist <= tol:
         return cp1  # intersection point (approximately)
     return None
- 
- 
-def split_ribs_by_crossings(rib_solids, rib_center_lines, plane_normal, tol=1.0):
-    """
-    For each rib solid, cut it by all other rib solids whose centre
-    lines cross it. Returns a flat list of all resulting solid pieces.
- 
-    tol: distance tolerance (mm) for deciding if two rib lines cross.
-         Should be >= rib_width to catch near-misses.
-    """
-    n = len(rib_solids)
- 
-    # Build crossing map: for each rib i, which ribs j cross it?
-    crossing_map = {i: [] for i in range(n)}
-    for i in range(n):
-        si = rib_center_lines[i].Vertexes[0].Point
-        ei = rib_center_lines[i].Vertexes[-1].Point
-        try:
-            di_raw = FreeCAD.Vector(ei.x-si.x, ei.y-si.y, ei.z-si.z)
-            L = di_raw.Length
-            if L < 1e-6:
-                continue
-            di = FreeCAD.Vector(di_raw.x/L, di_raw.y/L, di_raw.z/L)
-        except Exception:
-            continue
- 
-        for j in range(i+1, n):
-            sj = rib_center_lines[j].Vertexes[0].Point
-            ej = rib_center_lines[j].Vertexes[-1].Point
-            try:
-                dj_raw = FreeCAD.Vector(ej.x-sj.x, ej.y-sj.y, ej.z-sj.z)
-                Lj = dj_raw.Length
-                if Lj < 1e-6:
-                    continue
-                dj = FreeCAD.Vector(dj_raw.x/Lj, dj_raw.y/Lj, dj_raw.z/Lj)
-            except Exception:
-                continue
- 
-            pt = _lines_intersect_3d(si, di, sj, dj, tol=tol)
-            if pt is not None:
-                crossing_map[i].append(j)
-                crossing_map[j].append(i)
- 
-    # Cut each rib by its crossing ribs
-    all_pieces = []
-    for i, rib in enumerate(rib_solids):
-        if not crossing_map[i]:
-            all_pieces.append(rib)
-            continue
- 
-        # Fuse all crossing ribs into one cutting tool
-        cutters = [rib_solids[j] for j in crossing_map[i]]
-        cut_tool = cutters[0]
-        for c in cutters[1:]:
-            try:
-                cut_tool = cut_tool.fuse(c)
-            except Exception:
-                pass
- 
-        try:
-            result = rib.cut(cut_tool)
-            if result.isNull():
-                all_pieces.append(rib)
-                continue
-            pieces = result.Solids if result.ShapeType in ("Compound", "CompSolid") else [result]
-            pieces = [p for p in pieces if not p.isNull() and p.Volume > 1e-6]
-            all_pieces.extend(pieces if pieces else [rib])
-        except Exception:
-            all_pieces.append(rib)
- 
-    return all_pieces
 
-def split_rib_faces_by_crossings(rib_faces, doc, vis, tol=1e-4):
+def split_rib_faces_by_crossings(rib_faces, rib_center_lines, doc, viz_params, tol=1e-4, rib_width=None):
     """
-    Cut each rib centre face by all other rib centre faces.
-    Where two faces from different families cross, each is split
-    at the intersection line, giving individual planar segments.
- 
-    Parameters
-    ----------
-    rib_faces : list of Part.Face
-        The rib centre surfaces from create_rib_centre_surfaces.
-    tol : float
-        Geometric tolerance for boolean operations.
- 
-    Returns
-    -------
-    list of Part.Face
-        All resulting face fragments, flat list.
+    Optimized version with spatial filtering to avoid O(n²) checks.
     """
- 
     n = len(rib_faces)
-    result_faces = []
- 
-    for i, face in enumerate(rib_faces):
-        current = [face]  # start with the whole face, progressively cut
- 
-        for j, other in enumerate(rib_faces):
-            if i == j:
-                continue
- 
-            # Check if they actually intersect before trying to cut
-            try:
-                section = face.section(other)
-                if section.isNull() or not section.Edges:
-                    continue  # no intersection, skip
-            except Exception:
-                continue
- 
-            # Cut all current fragments by this other face
-            next_fragments = []
-            for fragment in current:
+    if n == 0:
+        return []
+
+    # Get rib_width from parameters (or use tol as fallback)
+    rib_width = rib_width if rib_width is not None else tol
+
+    # Precompute bounding boxes for spatial filtering
+    bboxes = [face.BoundBox for face in rib_faces]
+
+    # Sort faces by X-center coordinate
+    face_centers_x = [(bbox.XMin + bbox.XMax) * 0.5 for bbox in bboxes]
+    sorted_indices = sorted(range(n), key=lambda i: face_centers_x[i])
+    sorted_faces = [rib_faces[i] for i in sorted_indices]
+    sorted_bboxes = [bboxes[i] for i in sorted_indices]
+
+    all_pieces = []
+
+    for i in range(n):
+        face = sorted_faces[i]
+        bbox_i = sorted_bboxes[i]
+        center_x_i = face_centers_x[i]
+
+        # Spatial pruning: only check within X-range ± rib_width
+        start_j = i + 1
+        # Find faces that could potentially overlap in X
+        end_j = n
+        for j in range(i + 1, n):
+            if sorted_bboxes[j].XMin > bbox_i.XMax:  # No overlap possible
+                break
+            end_j = j + 1
+
+        candidates = []
+        for j in range(start_j, end_j):
+            bbox_j = sorted_bboxes[j]
+            # Quick bounding box check
+            if bbox_i.intersect(bbox_j):
+                # Verify actual intersection before expensive cut
                 try:
-                    cut = fragment.cut(other)
-                    if cut.isNull():
-                        next_fragments.append(fragment)  # cut failed, keep original
-                        continue
-                    # Extract resulting faces from the cut
-                    faces_out = cut.Faces if hasattr(cut, 'Faces') else [cut]
-                    valid = [f for f in faces_out
-                             if f is not None and not f.isNull() and f.Area > tol]
-                    if valid:
-                        next_fragments.extend(valid)
-                    else:
-                        next_fragments.append(fragment)
+                    section = face.section(sorted_faces[j])
+                    if section.isNull() or not section.Edges:
+                        continue  # No intersection
                 except Exception:
-                    next_fragments.append(fragment)
- 
-            current = next_fragments
- 
-        result_faces.extend(current)
-    if vis:
+                    continue  # Skip on error
+                candidates.append(sorted_faces[j])
+
+        if candidates:
+            # Batch cut: fuse all candidates into one tool
+            cut_tool = candidates[0]
+            for c in candidates[1:]:
+                try:
+                    cut_tool = cut_tool.fuse(c)
+                except Exception:
+                    pass  # Skip problematic fusions
+
+            try:
+                result = face.cut(cut_tool)
+                if not result.isNull():
+                    # Extract valid faces from result
+                    faces_out = result.Faces if hasattr(result, 'Faces') else [result]
+                    valid_faces = [f for f in faces_out
+                                 if f is not None and not f.isNull() and f.Area > tol]
+                    if valid_faces:
+                        all_pieces.extend(valid_faces)
+                    else:
+                        all_pieces.append(face)  # Keep original if cut produced nothing valid
+            except Exception:
+                all_pieces.append(face)  # Keep original on error
+        else:
+            all_pieces.append(face)  # No candidates, keep original
+
+    if viz_params:
         from viz_utils import show_rib_segments
-        show_rib_segments(result_faces, doc)
-    return result_faces
+        show_rib_segments(all_pieces, doc)
+
+    return all_pieces
 
 def create_rectangular_cutout_from_boundary(face, margin=1.0):
     """

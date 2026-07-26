@@ -116,7 +116,14 @@ def main(params):
     log_op("Generating rib centre surfaces")
     rib_centre_surfaces, _ = create_rib_centre_surfaces(wing_shape, all_center_lines, params.plane_normal, doc, vis=params.vis_rib_centre_surfaces)
     log_op("Splitting rib faces by crossings")
-    rib_centre_segments = split_rib_faces_by_crossings(rib_centre_surfaces, doc, vis=params.vis_rib_surface_segments)
+    # split_rib_faces_by_crossings requires both the surfaces and their guiding lines
+    rib_centre_segments = split_rib_faces_by_crossings(
+        rib_centre_surfaces,
+        all_center_lines,  # Pass the actual line data here
+        doc,
+        viz_params=params.vis_rib_surface_segments,
+        tol=1e-4
+    )
 
     # 3. Create cutout faces (rectangular holes)
     log_op("Creating cutout faces")
@@ -212,8 +219,8 @@ if __name__ == "__main__":
         doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.FCStd",
         # obj_name='Nose001',
         # obj_name='WingR1_msv001_solid',
-        obj_name='Part__Feature_solid',
-        # obj_name='Extrude001',
+        # obj_name='Part__Feature_solid',
+        obj_name='Extrude001',
         # ===== GEOMETRY PARAMETERS =====
         nozzle_diameter=0.4,
         rib_spacing=20.0,
