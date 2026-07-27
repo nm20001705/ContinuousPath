@@ -1,699 +1,621 @@
-# slab_utils.py
+# slab_utils.py – Mesh-optimised using trimesh (fully corrected)
+
 import FreeCAD
 import Part
+import Mesh
+import MeshPart
 import math
 import sys
-
-# ===== FreeCAD Profiler Helper =====
-import FreeCAD
 import time
-import sys
+import os
+import tempfile
+import numpy as np
+import trimesh
+import shapely.geometry as sg
+from shapely.ops import polygonize
+from functools import wraps
 
+# ------------------------------------------------------------
+# Profiling (complete)
+# ------------------------------------------------------------
 class FreeCADProfiler:
-    """FreeCAD-friendly performance profiler without external dependencies."""
     def __init__(self):
         self.operation_stack = []
-        self.enabled = True  # Always enable for profiling
+        self.enabled = True
 
     def log_op(self, name: str, level: int = 0):
-        """Start timing a new operation"""
         if not self.enabled:
             return
-
-        # End any previous operation
         if self.operation_stack:
             prev_name, prev_start = self.operation_stack[-1]
             duration = time.time() - prev_start
             prefix = "  " * (level - 1)
             sys.stdout.write(f"{prefix}--> {prev_name} completed in {duration:.2f}s\n")
             sys.stdout.flush()
-
-        # Start new operation
         self.operation_stack.append((name, time.time()))
         prefix = "  " * level
         sys.stdout.write(f"{prefix}Starting: {name}\n")
         sys.stdout.flush()
 
     def end_op(self, obj_count: int = 0):
-        """End current operation with object count"""
         if not self.enabled or not self.operation_stack:
             return
-
         name, start_time = self.operation_stack.pop()
         duration = time.time() - start_time
         prefix = "  " * len(self.operation_stack)
-
         if obj_count > 0:
-            sys.stdout.write(f"{prefix}✓ {name} completed in {duration:.2f}s ({obj_count} objects)\n")
+            sys.stdout.write(f"{prefix}✅ {name} completed in {duration:.2f}s ({obj_count} objects)\n")
         else:
             sys.stdout.write(f"{prefix}✅ {name} completed in {duration:.2f}s\n")
         sys.stdout.flush()
 
     def log(self, msg: str, level: int = 0):
-        """Simple log message with indentation"""
         if not self.enabled:
             return
         prefix = "  " * level
         sys.stdout.write(f"{prefix}📝 {msg}\n")
         sys.stdout.flush()
 
-# Global profiler instance
 profiler = FreeCADProfiler()
+log = profiler.log
+start_op = profiler.log_op
+end_op = profiler.end_op
+log_op = profiler.log
 
-# Convenience aliases
-log = profiler.log  # Simple log message
-start_op = profiler.log_op  # Start timing an operation
-end_op = profiler.end_op  # End timing an operation
-start_group = profiler.log_op  # Alias for start_op (indented start)
-end_group = profiler.end_op  # Alias for end_op (indented end)
-log_op = profiler.log  # Alias for simple logging (matches old interface)
+# ------------------------------------------------------------
+# Mesh repair (from your pure Python script)
+# ------------------------------------------------------------
+def repair_mesh(mesh):
+    if mesh is None:
+        return None
+    if isinstance(mesh, trimesh.Scene):
+        meshes = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not meshes:
+            return None
+        if len(meshes) == 1:
+            mesh = meshes[0]
+        else:
+            mesh = trimesh.util.concatenate(meshes)
+            if mesh is None:
+                return None
+    if not isinstance(mesh, trimesh.Trimesh):
+        return None
+    if len(mesh.faces) == 0:
+        return None
+    try:
+        merged = mesh.merge_vertices()
+        if merged is not None:
+            mesh = merged
+    except:
+        pass
+    try:
+        mesh.remove_degenerate_faces()
+    except:
+        pass
+    try:
+        mesh.fix_normals()
+    except:
+        pass
+    for max_hole in [0.01, 0.05, 0.1, 0.5, 1.0]:
+        try:
+            repaired = trimesh.repair.fill_holes(mesh, max_hole=max_hole)
+            if repaired is not None and repaired.is_watertight:
+                mesh = repaired
+                break
+        except:
+            continue
+    try:
+        trimesh.repair.wind_watertight(mesh)
+    except:
+        pass
+    try:
+        trimesh.repair.broken_faces(mesh)
+    except:
+        pass
+    try:
+        mesh.fix_normals()
+    except:
+        pass
+    if not mesh.is_watertight:
+        try:
+            hull = trimesh.convex.convex_hull(mesh.vertices)
+            if hull.is_watertight:
+                mesh = hull
+        except:
+            pass
+    return mesh
 
-def rotate_vector_around(v, axis, angle_rad):
-    c, s = math.cos(angle_rad), math.sin(angle_rad)
-    dot = v.x*axis.x + v.y*axis.y + v.z*axis.z
-    cross = FreeCAD.Vector(axis.y*v.z - axis.z*v.y,
-                           axis.z*v.x - axis.x*v.z,
-                           axis.x*v.y - axis.y*v.x)
-    return FreeCAD.Vector(
-        v.x*c + cross.x*s + axis.x*dot*(1-c),
-        v.y*c + cross.y*s + axis.y*dot*(1-c),
-        v.z*c + cross.z*s + axis.z*dot*(1-c)
-    )
+# ------------------------------------------------------------
+# Convert FreeCAD shape <-> trimesh
+# ------------------------------------------------------------
+def shape_to_trimesh(shape, deflection=0.5, angular=0.5):
+    """Convert a FreeCAD Part.Shape to a repaired trimesh.Trimesh."""
+    if shape is None or shape.isNull():
+        return None
+    with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp:
+        tmp_stl = tmp.name
+    try:
+        mesh_obj = MeshPart.meshFromShape(shape, LinearDeflection=deflection,
+                                          AngularDeflection=angular, Relative=False)
+        mesh_obj.write(tmp_stl)
+        tm = trimesh.load(tmp_stl, force='mesh')
+        os.unlink(tmp_stl)
+        if tm is not None:
+            tm = repair_mesh(tm)
+        return tm
+    except Exception as e:
+        print(f"  shape_to_trimesh failed: {e}")
+        try:
+            os.unlink(tmp_stl)
+        except:
+            pass
+        return None
 
+def trimesh_to_freecad(mesh):
+    """Convert a trimesh.Trimesh to FreeCAD Mesh.Mesh."""
+    if mesh is None or len(mesh.vertices) == 0:
+        return None
+    with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp:
+        tmp_stl = tmp.name
+    mesh.export(tmp_stl)
+    fc_mesh = Mesh.Mesh(tmp_stl)
+    os.unlink(tmp_stl)
+    return fc_mesh
+
+# ------------------------------------------------------------
+# Fast grid generation – all numpy (fixed TypeError)
+# ------------------------------------------------------------
 def create_angled_grid_lines(bb, params):
-    start_group("Grid Line Generation", level=0)
-    n, au, av = params.plane_normal, params.plane_axis_u, params.plane_axis_v
+    """
+    Returns two lists of (start, end) tuples, each a numpy array of shape (3,).
+    """
+    # Convert FreeCAD vectors to numpy arrays
+    n = np.array(params.plane_normal)
+    au = np.array(params.plane_axis_u)
+    av = np.array(params.plane_axis_v)
+
     corners = [
-        FreeCAD.Vector(bb.XMin, bb.YMin, bb.ZMin),
-        FreeCAD.Vector(bb.XMax, bb.YMin, bb.ZMin),
-        FreeCAD.Vector(bb.XMin, bb.YMax, bb.ZMin),
-        FreeCAD.Vector(bb.XMax, bb.YMax, bb.ZMin),
-        FreeCAD.Vector(bb.XMin, bb.YMin, bb.ZMax),
-        FreeCAD.Vector(bb.XMax, bb.YMin, bb.ZMax),
-        FreeCAD.Vector(bb.XMin, bb.YMax, bb.ZMax),
-        FreeCAD.Vector(bb.XMax, bb.YMax, bb.ZMax),
+        np.array([bb.XMin, bb.YMin, bb.ZMin]),
+        np.array([bb.XMax, bb.YMin, bb.ZMin]),
+        np.array([bb.XMin, bb.YMax, bb.ZMin]),
+        np.array([bb.XMax, bb.YMax, bb.ZMin]),
+        np.array([bb.XMin, bb.YMin, bb.ZMax]),
+        np.array([bb.XMax, bb.YMin, bb.ZMax]),
+        np.array([bb.XMin, bb.YMax, bb.ZMax]),
+        np.array([bb.XMax, bb.YMax, bb.ZMax]),
     ]
-    def dot(v, a): return v.x*a.x + v.y*a.y + v.z*a.z
-    span_u = max(dot(c, au) for c in corners) - min(dot(c, au) for c in corners)
-    span_v = max(dot(c, av) for c in corners) - min(dot(c, av) for c in corners)
-    if params.primary_dir:
-        pd = params.primary_dir
+
+    def dot(v, a): return np.dot(v, a)
+    u_vals = [dot(c, au) for c in corners]
+    v_vals = [dot(c, av) for c in corners]
+    span_u = max(u_vals) - min(u_vals)
+    span_v = max(v_vals) - min(v_vals)
+
+    pd = params.primary_dir
+    if pd is not None:
+        pd = np.array(pd)
     else:
         pd = au if span_u >= span_v else av
-    perp_pd = FreeCAD.Vector(n.y*pd.z - n.z*pd.y,
-                             n.z*pd.x - n.x*pd.z,
-                             n.x*pd.y - n.y*pd.x).normalize()
+
+    perp_pd = np.cross(n, pd)
+    perp_pd = perp_pd / np.linalg.norm(perp_pd)
+
     ang = math.radians(params.rib_angle)
     rot = math.radians(params.grid_orientation)
+
     def make_family_dir(sign):
-        d = FreeCAD.Vector(pd.x*math.cos(ang) + sign*perp_pd.x*math.sin(ang),
-                           pd.y*math.cos(ang) + sign*perp_pd.y*math.sin(ang),
-                           pd.z*math.cos(ang) + sign*perp_pd.z*math.sin(ang))
-        return rotate_vector_around(d, n, rot)
-    d1, d2 = make_family_dir(1), make_family_dir(-1)
-    center = FreeCAD.Vector((bb.XMin+bb.XMax)/2, (bb.YMin+bb.YMax)/2, (bb.ZMin+bb.ZMax)/2)
-    line_len = math.sqrt(bb.XLength**2 + bb.YLength**2 + bb.ZLength**2) * 2
+        d = pd * math.cos(ang) + sign * perp_pd * math.sin(ang)
+        k = n
+        theta = rot
+        d_rot = d * math.cos(theta) + np.cross(k, d) * math.sin(theta) + k * np.dot(k, d) * (1 - math.cos(theta))
+        return d_rot
+
+    d1 = make_family_dir(1)
+    d2 = make_family_dir(-1)
+
+    centre = np.array([(bb.XMin+bb.XMax)/2, (bb.YMin+bb.YMax)/2, (bb.ZMin+bb.ZMax)/2])
+    line_len = np.linalg.norm([bb.XLength, bb.YLength, bb.ZLength]) * 2
+
     def generate_lines(d):
-        stacking = FreeCAD.Vector(d.y*n.z - d.z*n.y, d.z*n.x - d.x*n.z, d.x*n.y - d.y*n.x).normalize()
-        proj_vals = [dot(c, stacking) for c in corners]
-        min_p, max_p = min(proj_vals), max(proj_vals)
+        stacking = np.cross(d, n)
+        stacking = stacking / np.linalg.norm(stacking)
+        proj_vals = [np.dot(c, stacking) for c in corners]
+        min_p = min(proj_vals)
+        max_p = max(proj_vals)
         num = int((max_p - min_p) / params.rib_spacing) + 3
-        center_proj = dot(center, stacking)
+        center_proj = np.dot(centre, stacking)
+
         lines = []
         for i in range(-1, num+1):
             offset = min_p + i * params.rib_spacing
             shift = offset - center_proj
-            p0 = FreeCAD.Vector(center.x + stacking.x*shift,
-                                center.y + stacking.y*shift,
-                                center.z + stacking.z*shift)
-            start = FreeCAD.Vector(p0.x - d.x*line_len, p0.y - d.y*line_len, p0.z - d.z*line_len)
-            end   = FreeCAD.Vector(p0.x + d.x*line_len, p0.y + d.y*line_len, p0.z + d.z*line_len)
-            lines.append(Part.makeLine(start, end))
+            p0 = centre + stacking * shift
+            start = p0 - d * line_len
+            end   = p0 + d * line_len
+            lines.append((start, end))
         return lines
-    lines1 = generate_lines(d1)
-    lines2 = generate_lines(d2)
-    log_op(f"Generated {len(lines1)} + {len(lines2)} = {len(lines1)+len(lines2)} grid lines", level=1)
-    end_op(len(lines1) + len(lines2))
-    return lines1, lines2
 
-def create_rib_faces(lines, plane_normal, rib_width):
-    start_group("Rib Face Creation", level=1)
-    half_w = rib_width / 2.0
-    faces = []
-    for line in lines:
+    return generate_lines(d1), generate_lines(d2)
+
+# ------------------------------------------------------------
+# Rib and bridge creation (from your pure Python script)
+# ------------------------------------------------------------
+def create_rib_mesh(start, end, plane_normal, rib_width, y_extent):
+    d = end - start
+    length = np.linalg.norm(d)
+    if length < 1e-8:
+        return None
+    d = d / length
+    n_rib = np.cross(d, plane_normal)
+    n_rib = n_rib / np.linalg.norm(n_rib)
+    box = trimesh.creation.box(extents=[length, rib_width, y_extent])
+    rot = np.eye(3)
+    rot[:,0] = d
+    rot[:,1] = n_rib
+    rot[:,2] = plane_normal
+    centre = (start + end) / 2.0
+    T = np.eye(4)
+    T[:3,:3] = rot
+    T[:3,3] = centre - rot @ np.array([0,0,0])
+    box.apply_transform(T)
+    return box
+
+def get_rib_boundary_z_range(wing_mesh, start, end, plane_normal, tol=1e-3):
+    d = end - start
+    length = np.linalg.norm(d)
+    if length < 1e-6:
+        return None
+    d = d / length
+    z_min = None
+    z_max = None
+    pts = [start + d * t * length for t in np.linspace(0, 1, 101)]
+    contains = wing_mesh.contains(pts)
+    for i, pt in enumerate(pts):
+        if contains[i]:
+            if z_min is None or pt[2] < z_min:
+                z_min = pt[2]
+            if z_max is None or pt[2] > z_max:
+                z_max = pt[2]
+    if z_min is not None and z_max is not None:
+        return z_min, z_max
+    return None
+
+def create_holed_rib_union(wing_mesh, rib_lines, params, plane_normal, rib_width, y_extent, margin, debug_dir=None):
+    log("  Building rib meshes...")
+    rib_meshes = []
+    for idx, (start, end) in enumerate(rib_lines):
+        m = create_rib_mesh(start, end, plane_normal, rib_width, y_extent)
+        if m is not None:
+            rib_meshes.append(m)
+    if not rib_meshes:
+        return None
+    log(f"  Unioning {len(rib_meshes)} ribs...")
+    rib_union = rib_meshes[0]
+    for m in rib_meshes[1:]:
         try:
-            start, end = line.Vertexes[0].Point, line.Vertexes[-1].Point
-            dir_vec = (end - start).normalize()
-            perp = dir_vec.cross(plane_normal).normalize() * half_w
-            p1 = start + perp
-            p2 = start - perp
-            p3 = end - perp
-            p4 = end + perp
-            wire = Part.makePolygon([p1, p2, p3, p4, p1])
-            faces.append(Part.Face(wire))
-        except Exception:
-            pass
-    log(f"📊 Created {len(faces)} rib faces", level=1)
-    end_op(len(faces))
-    return faces
-
-def extrude_rib_faces_to_solids(faces, plane_normal, bb):
-    start_group("Rib Solid Extrusion", level=1)
-    n = plane_normal.normalize()
-    def dot(v, a): return v.x*a.x + v.y*a.y + v.z*a.z
-    corners = [FreeCAD.Vector(bb.XMin, bb.YMin, bb.ZMin),
-               FreeCAD.Vector(bb.XMax, bb.YMax, bb.ZMax)]
-    min_along_n = min(dot(c, n) for c in corners)
-    max_along_n = max(dot(c, n) for c in corners)
-    extrude_depth = (max_along_n - min_along_n) * 1.2
-    extrude_vec = n * extrude_depth
-    solids = []
-    for face in faces:
-        try:
-            face_proj = dot(face.CenterOfMass, n)
-            shift = min_along_n - face_proj - extrude_depth * 0.1
-            f = face.copy()
-            f.translate(n * shift)
-            solids.append(f.extrude(extrude_vec))
-        except Exception:
-            continue
-    log(f"📊 Extruded {len(solids)} rib solids", level=1)
-    end_op(len(solids))
-    return solids
-
-def add_bridges_along_ribs(cut_body, rib_center_lines, rib_width, plane_normal, bridge_size=None):
-    start_group("Bridge Generation", level=1)
-    if bridge_size is None:
-        bridge_size = rib_width * 0.5
-    if cut_body.ShapeType in ("Compound", "CompSolid"):
-        solids = cut_body.Solids
-    else:
-        solids = [cut_body]
-    n = plane_normal.normalize()
-    bridges = []
-    for line in rib_center_lines:
-        start, end = line.Vertexes[0].Point, line.Vertexes[-1].Point
-        mid = (start + end) * 0.5
-        rib_dir = (end - start).normalize()
-        span_dir = n
-        third_dir = rib_dir.cross(span_dir).normalize()
-        len_along_rib = bridge_size
-        len_along_span = rib_width * 1.1
-        len_along_third = bridge_size
-        box = Part.makeBox(len_along_rib, len_along_span, len_along_third)
-        box.translate(FreeCAD.Vector(-len_along_rib/2, -len_along_span/2, -len_along_third/2))
-        mat = FreeCAD.Matrix()
-        mat.A11, mat.A12, mat.A13 = rib_dir.x, span_dir.x, third_dir.x
-        mat.A21, mat.A22, mat.A23 = rib_dir.y, span_dir.y, third_dir.y
-        mat.A31, mat.A32, mat.A33 = rib_dir.z, span_dir.z, third_dir.z
-        mat.A44 = 1.0
-        rot = FreeCAD.Rotation(mat)
-        box.Placement = FreeCAD.Placement(mid, rot)
-        bridges.append(box)
-    if not bridges:
-        log("📊 No bridges created", level=1)
-        end_op()
-        return cut_body
-    all_parts = solids + bridges
-    unified = all_parts[0]
-    for p in all_parts[1:]:
-        try:
-            unified = unified.fuse(p)
-        except Exception:
-            pass
-    log(f"📊 Created {len(bridges)} bridges", level=1)
-    end_op()
-    return unified
-
-def create_cut_result(body, params, doc=None, vis_cut_wing=False, vis_centre_lines=False, cutout_faces=None):
-    """Returns (cut_shape, rib_center_lines, list_of_valid_rib_solids)"""
-    start_group("Cut Result Generation", level=0)
-    if doc is None:
-        doc = FreeCAD.ActiveDocument
-    raw_shape = body.Shape if hasattr(body, "Shape") else body
-    bb = raw_shape.BoundBox
-
-    lines1, lines2 = create_angled_grid_lines(bb, params)
-    all_center_lines = lines1 + lines2
-
-    rib_faces1 = create_rib_faces(lines1, params.plane_normal, params.rib_width)
-    rib_faces2 = create_rib_faces(lines2, params.plane_normal, params.rib_width)
-    rib_solids1 = extrude_rib_faces_to_solids(rib_faces1, params.plane_normal, bb)
-    rib_solids2 = extrude_rib_faces_to_solids(rib_faces2, params.plane_normal, bb)
-    all_rib_solids = rib_solids1 + rib_solids2
-
-    # Apply holes if any cutout faces are provided
-    if cutout_faces:
-        all_rib_solids = apply_holes_to_ribs(all_rib_solids, cutout_faces,
-                                             params.rib_width, params.plane_normal, doc)
-
-    # Filter ribs that intersect the wing
-    valid_ribs = []
-    for rib in all_rib_solids:
-        try:
-            common = rib.common(raw_shape)
-            if common is None or common.Volume < 1.0:
-                continue
-            valid_ribs.append(rib)
-        except Exception:
-            continue
-
-    if not valid_ribs:
-        raise ValueError("No rib solids significantly intersect the wing.")
-
-    def fuse_list(lst):
-        if not lst:
-            return None
-        f = lst[0]
-        for s in lst[1:]:
+            rib_union = trimesh.boolean.union([rib_union, m], engine='manifold')
+        except:
             try:
-                f = f.fuse(s)
+                rib_union = trimesh.boolean.union([rib_union, m], engine='scad')
             except:
-                pass
-        return f
+                print("  Skipping a rib due to union failure")
+                continue
+    if not params.create_holes:
+        return rib_union
 
-    fused_ribs = fuse_list(valid_ribs)
-    log(f"📊 Fusing {len(valid_ribs)} valid ribs", level=1)
-    cut_result = raw_shape.cut(fused_ribs)
+    # ---- Cutouts ----
+    log("  Generating cutouts...")
+    wing_simple = wing_mesh.simplify_quadric_decimation(face_count=20000)
+    cutout_prisms = []
+    for idx, (start, end) in enumerate(rib_lines):
+        d = end - start
+        length = np.linalg.norm(d)
+        if length < 1e-8:
+            continue
+        d = d / length
+        n_rib = np.cross(d, plane_normal)
+        n_rib = n_rib / np.linalg.norm(n_rib)
+        origin = start
 
+        try:
+            path = trimesh.intersections.slice_mesh_plane(wing_simple, plane_normal=n_rib, plane_origin=origin)
+        except:
+            continue
+        if path is None or len(path.vertices) < 3:
+            continue
+
+        verts = path.vertices
+        edges = path.edges
+        u = verts[edges[0][1]] - verts[edges[0][0]]
+        u_norm = np.linalg.norm(u)
+        if u_norm < 1e-8:
+            u = np.cross(n_rib, [1,0,0])
+            if np.linalg.norm(u) < 1e-8:
+                u = np.cross(n_rib, [0,1,0])
+            u = u / np.linalg.norm(u)
+        else:
+            u = u / u_norm
+        v = np.cross(n_rib, u)
+        v = v / np.linalg.norm(v)
+
+        coords_2d = []
+        for p in verts:
+            dx = np.dot(p - origin, u)
+            dy = np.dot(p - origin, v)
+            coords_2d.append((dx, dy))
+
+        lines_2d = []
+        for edge in edges:
+            p1 = coords_2d[edge[0]]
+            p2 = coords_2d[edge[1]]
+            lines_2d.append(sg.LineString([p1, p2]))
+        merged = sg.MultiLineString(lines_2d)
+        polygons = list(polygonize(merged))
+        if not polygons:
+            continue
+        poly = max(polygons, key=lambda p: p.area)
+        if poly.is_empty or poly.area < 1e-8:
+            continue
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+
+        height = rib_width * 1.05
+        transform = np.eye(4)
+        transform[:3,:3] = np.column_stack([u, v, n_rib])
+        transform[:3,3] = origin
+
+        try:
+            extruded = trimesh.creation.extrude_polygon(poly, height, transform=transform)
+        except:
+            continue
+        if extruded is None or not extruded.is_volume:
+            continue
+        cutout_prisms.append(extruded)
+
+    if cutout_prisms:
+        log(f"  Unioning {len(cutout_prisms)} cutouts...")
+        cutout_union = cutout_prisms[0]
+        for cp in cutout_prisms[1:]:
+            try:
+                cutout_union = trimesh.boolean.union([cutout_union, cp], engine='manifold')
+            except:
+                try:
+                    cutout_union = trimesh.boolean.union([cutout_union, cp], engine='scad')
+                except:
+                    print("  Skipping a cutout due to union failure")
+                    continue
+        if cutout_union.is_volume and rib_union.is_volume:
+            log("  Subtracting cutouts from ribs...")
+            try:
+                rib_union = trimesh.boolean.difference([rib_union, cutout_union], engine='manifold')
+            except:
+                try:
+                    rib_union = trimesh.boolean.difference([rib_union, cutout_union], engine='scad')
+                except:
+                    print("  Cutout subtraction failed – skipping holes.")
+    return rib_union
+
+def collect_midpoints(rib_lines, rib_z_ranges, z_step):
+    data_by_rib = {}
+    for idx, (start, end) in enumerate(rib_lines):
+        z_min, z_max = rib_z_ranges[idx]
+        if z_min is None or z_max is None:
+            continue
+        d = end - start
+        length = np.linalg.norm(d)
+        if length < 1e-8:
+            continue
+        d = d / length
+        z_start = start[2]
+        z_end = end[2]
+        z_low = max(z_start, z_min) if z_start < z_end else max(z_end, z_min)
+        z_high = min(z_start, z_max) if z_start > z_end else min(z_end, z_max)
+        if z_high - z_low < 1e-6:
+            continue
+        points = []
+        z = z_low
+        while z <= z_high + 1e-6:
+            t = (z - start[2]) / (end[2] - start[2]) if abs(end[2] - start[2]) > 1e-8 else 0
+            pt = start + t * (end - start)
+            points.append((z, pt))
+            z += z_step
+        for z_bound in (z_min, z_max):
+            t = (z_bound - start[2]) / (end[2] - start[2]) if abs(end[2] - start[2]) > 1e-8 else 0
+            pt = start + t * (end - start)
+            if not any(abs(z_bound - p[0]) < 1e-4 for p in points):
+                points.append((z_bound, pt))
+        points.sort(key=lambda x: x[0])
+        data_by_rib[idx] = points
+    return data_by_rib
+
+def create_bridge_meshes(data_by_rib, plane_normal, rib_width, bridge_height):
+    bridges = []
+    for idx, pts in data_by_rib.items():
+        if len(pts) < 2:
+            continue
+        for i in range(len(pts)-1):
+            p1 = pts[i][1]
+            p2 = pts[i+1][1]
+            d = p2 - p1
+            length = np.linalg.norm(d)
+            if length < 1e-8:
+                continue
+            d = d / length
+            n_rib = np.cross(d, plane_normal)
+            n_rib = n_rib / np.linalg.norm(n_rib)
+            box = trimesh.creation.box(extents=[length, rib_width, bridge_height])
+            rot = np.eye(3)
+            rot[:,0] = d
+            rot[:,1] = n_rib
+            rot[:,2] = plane_normal
+            centre = (p1 + p2) / 2.0
+            T = np.eye(4)
+            T[:3,:3] = rot
+            T[:3,3] = centre - rot @ np.array([0,0,0])
+            box.apply_transform(T)
+            bridges.append(box)
+    return bridges
+
+# ------------------------------------------------------------
+# Main fast pipeline (manual profiling)
+# ------------------------------------------------------------
+def create_cut_result_mesh(wing_shape, params, doc, vis_cut_wing=False, vis_centre_lines=False, cutout_faces=None):
+    start_op("create_cut_result_mesh")
+    # Convert wing shape to trimesh
+    wing_mesh = shape_to_trimesh(wing_shape, deflection=0.5, angular=0.5)
+    if wing_mesh is None:
+        raise RuntimeError("Failed to convert wing to trimesh")
+
+    bb = wing_shape.BoundBox
+
+    # 1. Grid lines (numpy arrays)
+    lines1, lines2 = create_angled_grid_lines(bb, params)
+    all_lines = lines1 + lines2  # list of (start, end) tuples
+
+    # Convert to FreeCAD lines for visualisation and later use
+    all_center_lines = []
+    for start, end in all_lines:
+        line = Part.makeLine(FreeCAD.Vector(*start), FreeCAD.Vector(*end))
+        all_center_lines.append(line)
+
+    # 2. Rib union with holes
+    y_extent = (bb.YMax - bb.YMin) * 1.2
+    rib_union = create_holed_rib_union(wing_mesh, all_lines, params,
+                                       params.plane_normal, params.rib_width,
+                                       y_extent, params.cutout_marging)
+    if rib_union is None:
+        print("No ribs generated – returning original wing.")
+        end_op()
+        return trimesh_to_freecad(wing_mesh), all_center_lines, []
+
+    # 3. Subtract ribs from wing
+    if wing_mesh.is_watertight and rib_union.is_volume:
+        try:
+            cut_wing = trimesh.boolean.difference([wing_mesh, rib_union], engine='manifold')
+        except:
+            try:
+                cut_wing = trimesh.boolean.difference([wing_mesh, rib_union], engine='scad')
+            except:
+                cut_wing = wing_mesh
+    else:
+        cut_wing = wing_mesh
+
+    # 4. Convert to FreeCAD mesh for visualisation
+    cut_wing_fc = trimesh_to_freecad(cut_wing)
     if vis_cut_wing:
-        from viz_utils import show_cut_wing
-        show_cut_wing(cut_result, doc, transparency=80)
+        from viz_utils import show_mesh
+        show_mesh(cut_wing_fc, doc, "CutWingMesh", transparency=80)
 
     if vis_centre_lines:
         from viz_utils import show_rib_centre_lines
         show_rib_centre_lines(all_center_lines, doc)
 
-    log(f"✅ Cut result created", level=1)
     end_op()
-    return cut_result, all_center_lines, valid_ribs
+    return cut_wing_fc, all_center_lines, [rib_union]
 
-def generate_final_solid(body, params, doc=None, add_bridges=True):
-    """Returns the final solid (cut + bridges)"""
-    cut_result, center_lines, rib_solids = create_cut_result(body, params, doc)
-    if add_bridges:
-        result = add_bridges_along_ribs(cut_result, center_lines,
-                                        params.rib_width, params.plane_normal,
-                                        bridge_size=params.rib_width * 10)
-    else:
-        result = cut_result
-    if doc:
-        obj = doc.addObject("Part::Feature", "WingWithInfill")
-        obj.Shape = result
-        doc.recompute()
-    return result
-
-
-def merge_and_show_final(cut_result, bridges_shape, doc, vis=True):
-    """
-    Fuse the cut wing with the bridges shape.
-    If vis is True, display the final solid using viz_utils.show_final_solid.
-    Returns the fused solid (or None if bridges_shape is invalid).
-    """
-    if not bridges_shape or bridges_shape.isNull():
-        return None
-    final = cut_result.fuse(bridges_shape)
-    if vis:
-        from viz_utils import show_final_solid
-        show_final_solid(final, doc)
-    return final
-
-def create_rib_centre_surfaces(wing_shape, rib_center_lines, plane_normal, doc, vis=False, tol=1e-4):
-    """
-    Returns (faces, edges).
-    faces: list of Part.Face — one for each closed region (including holes)
-    edges: list of Part.Edge — all raw intersection edges
-    """
-    faces = []
-    all_edges = []
-
+def create_bridges_trimmed_to_wing_mesh(data_by_rib, rib_center_lines, plane_normal,
+                                        rib_width, bridge_height, wing_mesh,
+                                        extend_length=5.0, doc=None, vis=False):
+    start_op("create_bridges_trimmed_to_wing_mesh")
+    # Convert FreeCAD lines to numpy points
+    rib_lines = []
     for line in rib_center_lines:
-        start = line.Vertexes[0].Point
-        end   = line.Vertexes[-1].Point
-        rib_dir = (end - start).normalize()
-        n_rib = rib_dir.cross(plane_normal).normalize()
-        plane = Part.Plane(start, n_rib)
-        try:
-            intersect = wing_shape.section(plane)
-            if not intersect or not intersect.Edges:
-                continue
-            edges = list(intersect.Edges)
-            all_edges.extend(edges)
+        start = np.array(line.Vertexes[0].Point)
+        end = np.array(line.Vertexes[-1].Point)
+        rib_lines.append((start, end))
 
-            # ---- Build all closed wires by edge stitching ----
-            used = [False] * len(edges)
-            wires = []
-            for i in range(len(edges)):
-                if used[i]:
-                    continue
-                # Start a new wire
-                loop = [edges[i]]
-                used[i] = True
-                cur_end = edges[i].Vertexes[-1].Point
-                changed = True
-                while changed:
-                    changed = False
-                    for j, e in enumerate(edges):
-                        if used[j]:
-                            continue
-                        if e.Vertexes[0].Point.isEqual(cur_end, tol):
-                            loop.append(e)
-                            used[j] = True
-                            cur_end = e.Vertexes[-1].Point
-                            changed = True
-                            break
-                        elif e.Vertexes[-1].Point.isEqual(cur_end, tol):
-                            rev = e.copy()
-                            rev.reverse()
-                            loop.append(rev)
-                            used[j] = True
-                            cur_end = e.Vertexes[0].Point
-                            changed = True
-                            break
-                # Close the wire
-                if len(loop) > 1:
-                    try:
-                        wire = Part.Wire(loop)
-                        wires.append(wire)
-                    except:
-                        continue
-
-            # For each closed wire, create a face. We will not attempt to detect nesting; just create faces.
-            # If there is nesting, some faces may be holes, but they will be separate objects.
-            # That's acceptable for visualisation and further processing.
-            for wire in wires:
-                if wire.isClosed() and not wire.isNull():
-                    try:
-                        face = Part.Face(wire)
-                        if face.isValid():
-                            faces.append(face)
-                    except:
-                        # Fallback: try to create face with tolerance
-                        try:
-                            face = Part.Face(wire, tolerance=tol)
-                            if face.isValid():
-                                faces.append(face)
-                        except:
-                            continue
-        except Exception:
+    # Convert data_by_rib (from point_utils) to our format: (z, point)
+    bridge_data = {}
+    for idx, data in data_by_rib.items():
+        pts = [np.array(p) for p in data['mid']]
+        if len(pts) < 2:
             continue
-    if vis:
-        from viz_utils import show_rib_centre_surfaces, show_rib_centre_edges
-        show_rib_centre_surfaces(faces, doc, color=(0.8, 0.4, 0.8), transparency=50)
-        print(f"Created {len(faces)} rib centre surfaces.")
-        show_rib_centre_edges(edges, doc, line_color=(0.2, 0.5, 1.0), line_width=2)
-        print(f"Created {len(edges)} rib centre edges.")
-    return faces, all_edges
-
-def _lines_intersect_3d(p1, d1, p2, d2, tol=1.0):
-    """
-    Test if two infinite lines (p1+t*d1) and (p2+s*d2) pass within
-    `tol` of each other. Returns the closest point on line1 if they
-    are close enough, else None.
- 
-    Uses the standard closest-point-between-two-lines formula.
-    """
-    import math
-    w = FreeCAD.Vector(p1.x - p2.x, p1.y - p2.y, p1.z - p2.z)
- 
-    def dot(a, b): return a.x*b.x + a.y*b.y + a.z*b.z
- 
-    a = dot(d1, d1)
-    b = dot(d1, d2)
-    c = dot(d2, d2)
-    d = dot(d1, w)
-    e = dot(d2, w)
- 
-    denom = a*c - b*b
-    if abs(denom) < 1e-10:
-        return None  # parallel lines
- 
-    t = (b*e - c*d) / denom
-    s = (a*e - b*d) / denom
- 
-    # Closest points
-    cp1 = FreeCAD.Vector(p1.x + d1.x*t, p1.y + d1.y*t, p1.z + d1.z*t)
-    cp2 = FreeCAD.Vector(p2.x + d2.x*s, p2.y + d2.y*s, p2.z + d2.z*s)
- 
-    dist = math.sqrt((cp1.x-cp2.x)**2 + (cp1.y-cp2.y)**2 + (cp1.z-cp2.z)**2)
-    if dist <= tol:
-        return cp1  # intersection point (approximately)
-    return None
-
-def split_rib_faces_by_crossings(rib_faces, rib_center_lines, doc, viz_params, tol=1e-4, rib_width=None):
-    """
-    Optimized version with spatial filtering to avoid O(n²) checks.
-    """
-    n = len(rib_faces)
-    if n == 0:
-        return []
-
-    # Get rib_width from parameters (or use tol as fallback)
-    rib_width = rib_width if rib_width is not None else tol
-
-    # Precompute bounding boxes for spatial filtering
-    bboxes = [face.BoundBox for face in rib_faces]
-
-    # Sort faces by X-center coordinate
-    face_centers_x = [(bbox.XMin + bbox.XMax) * 0.5 for bbox in bboxes]
-    sorted_indices = sorted(range(n), key=lambda i: face_centers_x[i])
-    sorted_faces = [rib_faces[i] for i in sorted_indices]
-    sorted_bboxes = [bboxes[i] for i in sorted_indices]
-
-    all_pieces = []
-
-    for i in range(n):
-        face = sorted_faces[i]
-        bbox_i = sorted_bboxes[i]
-        center_x_i = face_centers_x[i]
-
-        # Spatial pruning: only check within X-range ± rib_width
-        start_j = i + 1
-        # Find faces that could potentially overlap in X
-        end_j = n
-        for j in range(i + 1, n):
-            if sorted_bboxes[j].XMin > bbox_i.XMax:  # No overlap possible
-                break
-            end_j = j + 1
-
-        candidates = []
-        for j in range(start_j, end_j):
-            bbox_j = sorted_bboxes[j]
-            # Quick bounding box check
-            if bbox_i.intersect(bbox_j):
-                # Verify actual intersection before expensive cut
-                try:
-                    section = face.section(sorted_faces[j])
-                    if section.isNull() or not section.Edges:
-                        continue  # No intersection
-                except Exception:
-                    continue  # Skip on error
-                candidates.append(sorted_faces[j])
-
-        if candidates:
-            # Batch cut: fuse all candidates into one tool
-            cut_tool = candidates[0]
-            for c in candidates[1:]:
-                try:
-                    cut_tool = cut_tool.fuse(c)
-                except Exception:
-                    pass  # Skip problematic fusions
-
-            try:
-                result = face.cut(cut_tool)
-                if not result.isNull():
-                    # Extract valid faces from result
-                    faces_out = result.Faces if hasattr(result, 'Faces') else [result]
-                    valid_faces = [f for f in faces_out
-                                 if f is not None and not f.isNull() and f.Area > tol]
-                    if valid_faces:
-                        all_pieces.extend(valid_faces)
-                    else:
-                        all_pieces.append(face)  # Keep original if cut produced nothing valid
-            except Exception:
-                all_pieces.append(face)  # Keep original on error
+        pts_sorted = sorted(pts, key=lambda p: p[2])
+        if len(pts_sorted) >= 2:
+            dir0 = pts_sorted[1] - pts_sorted[0]
+            dir0 = dir0 / np.linalg.norm(dir0)
+            p_before = pts_sorted[0] - dir0 * extend_length
+            dir_last = pts_sorted[-1] - pts_sorted[-2]
+            dir_last = dir_last / np.linalg.norm(dir_last)
+            p_after = pts_sorted[-1] + dir_last * extend_length
+            pts_extended = [p_before] + pts_sorted + [p_after]
         else:
-            all_pieces.append(face)  # No candidates, keep original
-
-    if viz_params:
-        from viz_utils import show_rib_segments
-        show_rib_segments(all_pieces, doc)
-
-    return all_pieces
-
-def create_rectangular_cutout_from_boundary(face, margin=1.0):
-    """
-    For a planar face (rib segment), compute a quadrilateral cutout.
-    If the face has holes (inner loops), split it into separate faces and process each.
-    Returns a list of cutout faces (could be empty, one, or several).
-    """
-    # Helper to process a single face (no holes)
-    def process_single_face(f, margin):
-        wires = f.Wires
-        if not wires:
-            return None
-        wire = wires[0]
-        # Collect vertices
-        vertices = []
-        for edge in wire.Edges:
-            vertices.append(edge.Vertexes[0].Point)
-            vertices.append(edge.Vertexes[-1].Point)
-        uniq = []
-        for p in vertices:
-            if not any(p.distanceToPoint(q) < 1e-4 for q in uniq):
-                uniq.append(p)
-        if len(uniq) < 4:
-            return None
-        # Group by Z
-        z_groups = {}
-        for p in uniq:
-            key = round(p.z, 4)
-            z_groups.setdefault(key, []).append(p)
-        z_min = min(z_groups.keys())
-        z_max = max(z_groups.keys())
-        low_pts = z_groups[z_min]
-        high_pts = z_groups[z_max]
-        low_cent = FreeCAD.Vector(0,0,0)
-        for p in low_pts: low_cent += p
-        low_cent /= len(low_pts)
-        high_cent = FreeCAD.Vector(0,0,0)
-        for p in high_pts: high_cent += p
-        high_cent /= len(high_pts)
-        z_mid = (low_cent.z + high_cent.z) / 2.0
-        # Mid plane
-        plane = Part.Plane(FreeCAD.Vector(0,0,z_mid), FreeCAD.Vector(0,0,1))
-        try:
-            section = f.section(plane)
-        except:
-            return None
-        if not section or len(section.Edges) == 0:
-            return None
-        mid_pts = []
-        for edge in section.Edges:
-            mid_pts.append(edge.Vertexes[0].Point)
-            mid_pts.append(edge.Vertexes[-1].Point)
-        uniq_mid = []
-        for p in mid_pts:
-            if not any(p.distanceToPoint(q) < 1e-4 for q in uniq_mid):
-                uniq_mid.append(p)
-        if len(uniq_mid) < 2:
-            return None
-        # Farthest pair
-        best_pair = None
-        max_dist = 0.0
-        for i in range(len(uniq_mid)):
-            for j in range(i+1, len(uniq_mid)):
-                d = uniq_mid[i].distanceToPoint(uniq_mid[j])
-                if d > max_dist:
-                    max_dist = d
-                    best_pair = (uniq_mid[i], uniq_mid[j])
-        if best_pair is None:
-            return None
-        left_mid, right_mid = best_pair
-        if left_mid.x > right_mid.x:
-            left_mid, right_mid = right_mid, left_mid
-        # Centroid and shifting
-        centroid = (low_cent + left_mid + high_cent + right_mid) / 4.0
-        def shift_towards(pt, center, margin):
-            dir_vec = pt - center
-            if dir_vec.Length < 1e-6:
-                return pt
-            return pt - dir_vec.normalize() * margin
-        low_shifted = shift_towards(low_cent, centroid, margin)
-        high_shifted = shift_towards(high_cent, centroid, margin)
-        left_shifted = shift_towards(left_mid, centroid, margin)
-        right_shifted = shift_towards(right_mid, centroid, margin)
-        ordered = [low_shifted, left_shifted, high_shifted, right_shifted]
-        try:
-            wire_out = Part.makePolygon(ordered + [ordered[0]])
-            face_out = Part.Face(wire_out)
-            if face_out.isValid() and face_out.Area > 1e-4:
-                # Check inside original face
-                sample_points = [low_shifted, left_shifted, high_shifted, right_shifted,
-                                (low_shifted + high_shifted) * 0.5,
-                                (left_shifted + right_shifted) * 0.5]
-                inside = True
-                for p in sample_points:
-                    if not f.isInside(p, 1e-3, True):
-                        inside = False
-                        break
-                if inside:
-                    return face_out
-        except:
-            pass
-        return None
-
-    # Main: if face has holes, split into separate faces first
-    if len(face.Wires) > 1:
-        # Extract outer wire and inner wires
-        wires = list(face.Wires)
-        outer = wires[0]
-        inners = wires[1:]
-        # For each inner wire, create a face that is the outer minus the inner
-        # (i.e., a face with a hole). Then process each such face?
-        # Actually, we want separate faces for each region outside the holes.
-        # Simpler: use the wire to build a new face that is only the outer boundary (ignoring holes),
-        # but that would include the hole area. We need to split into multiple faces.
-        # A practical approach: create a compound of faces by cutting the outer face with the inner wires.
-        # Use Part.Geom2d to split, but that's complex.
-        # For now, we skip faces with holes (old behaviour) – but you asked not to skip.
-        # Given the complexity, we will skip and print a warning.
-        print("  [warning] face with hole – skipping cutout (will not process both parts)")
-        return None
-    else:
-        return process_single_face(face, margin)
-
-def cutouts_from_segmens(rib_centre_segments, doc, vis, margin):
-    cutouts = []
-    for seg in rib_centre_segments:
-        cut = create_rectangular_cutout_from_boundary(seg, margin=margin)
-        if cut:
-            cutouts.append(cut)
-    if vis:
-        from viz_utils import show_rect_cutouts
-        show_rect_cutouts(cutouts, doc, color=(1.0,0.5,0.0), transparency=30)
-    return cutouts
-
-def apply_holes_to_ribs(rib_solids, cutout_faces, rib_width, plane_normal, doc=None):
-    """
-    For each cutout face, create a hole solid that spans the entire rib thickness
-    (centered on the face), then subtract it from the corresponding rib solid.
-    """
-    if not cutout_faces or not rib_solids:
-        return rib_solids
-
-    holes = []
-    for face in cutout_faces:
-        normal = face.normalAt(0.5, 0.5).normalize()
-        half = rib_width / 2.0
-        # Move face backward by half thickness
-        moved = face.copy()
-        moved.translate(normal * (-half))
-        try:
-            # Extrude forward by full thickness
-            solid = moved.extrude(normal * rib_width)
-            if not solid.isNull():
-                holes.append(solid)
-        except:
             continue
+        bridge_data[idx] = [(p[2], p) for p in pts_extended]
 
-    if not holes:
-        return rib_solids
+    bridge_meshes = create_bridge_meshes(bridge_data, plane_normal, rib_width, bridge_height)
+    if not bridge_meshes:
+        end_op()
+        return None
 
-    # Fuse all hole solids into one cutting tool
-    cutter = holes[0]
-    for h in holes[1:]:
-        cutter = cutter.fuse(h)
-
-    # Subtract the combined holes from each rib
-    holed = []
-    for rib in rib_solids:
+    # Union all bridges
+    bridge_union = bridge_meshes[0]
+    for bm in bridge_meshes[1:]:
         try:
-            cut_rib = rib.cut(cutter)
-            if cut_rib.isNull():
-                holed.append(rib)
-            else:
-                holed.append(cut_rib)
+            bridge_union = trimesh.boolean.union([bridge_union, bm], engine='manifold')
         except:
-            holed.append(rib)
-    return holed
+            try:
+                bridge_union = trimesh.boolean.union([bridge_union, bm], engine='scad')
+            except:
+                print("  Skipping a bridge union due to failure")
+                continue
+
+    # Intersect with wing mesh (if wing_mesh is provided as trimesh)
+    if wing_mesh is not None:
+        try:
+            trimmed = bridge_union.intersection(wing_mesh, engine='manifold')
+        except:
+            try:
+                trimmed = bridge_union.intersection(wing_mesh, engine='scad')
+            except:
+                trimmed = bridge_union
+        bridge_union = trimmed
+
+    if vis:
+        from viz_utils import show_mesh
+        fc_mesh = trimesh_to_freecad(bridge_union)
+        if fc_mesh:
+            show_mesh(fc_mesh, doc, "BridgesMesh", color=(0.0,0.8,0.0), transparency=30)
+
+    end_op()
+    return trimesh_to_freecad(bridge_union)
+
+def merge_and_show_final_mesh(cut_wing_fc, bridges_fc, doc, vis=True):
+    start_op("merge_and_show_final_mesh")
+    if bridges_fc is None or bridges_fc.CountFacets == 0:
+        final_fc = cut_wing_fc
+    else:
+        with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp1:
+            tmp1_stl = tmp1.name
+        with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp2:
+            tmp2_stl = tmp2.name
+        try:
+            cut_wing_fc.write(tmp1_stl)
+            bridges_fc.write(tmp2_stl)
+            tm1 = trimesh.load(tmp1_stl, force='mesh')
+            tm2 = trimesh.load(tmp2_stl, force='mesh')
+            if tm1 and tm2:
+                try:
+                    final_tm = trimesh.boolean.union([tm1, tm2], engine='manifold')
+                except:
+                    try:
+                        final_tm = trimesh.boolean.union([tm1, tm2], engine='scad')
+                    except:
+                        final_tm = tm1
+                final_fc = trimesh_to_freecad(final_tm)
+            else:
+                final_fc = cut_wing_fc
+        except Exception as e:
+            print(f"  Final union failed: {e}")
+            final_fc = cut_wing_fc
+        finally:
+            try:
+                os.unlink(tmp1_stl)
+                os.unlink(tmp2_stl)
+            except:
+                pass
+    if vis:
+        from viz_utils import show_mesh
+        show_mesh(final_fc, doc, "FinalMesh", color=(0.8,0.8,0.8), transparency=50)
+    end_op()
+    return final_fc

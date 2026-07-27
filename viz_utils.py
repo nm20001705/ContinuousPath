@@ -4,6 +4,21 @@ import FreeCADGui
 import Part
 import math
 
+def show_mesh(mesh, doc, name, color=None, transparency=None, display_mode="Shaded"):
+    """Display a Mesh object."""
+    obj = doc.addObject("Mesh::Feature", name)
+    obj.Mesh = mesh
+    if FreeCAD.GuiUp:
+        vp = FreeCADGui.ActiveDocument.getObject(obj.Name)
+        if vp:
+            if color is not None:
+                vp.ViewObject.ShapeColor = color
+            if transparency is not None:
+                vp.ViewObject.Transparency = transparency
+            vp.ViewObject.DisplayMode = display_mode
+    doc.recompute()
+    return obj
+
 def show_shape(obj_name, shape, doc, color=None, transparency=None,
                line_color=None, line_width=None, point_size=None,
                display_mode=None):

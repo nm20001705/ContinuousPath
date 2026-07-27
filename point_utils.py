@@ -1,11 +1,11 @@
-# point_utils.py
+# point_utils.py – as originally provided
 import FreeCAD
 import Part
 import math
 from collections import defaultdict
 
 # ------------------------------------------------------------
-# helpers (unchanged)
+# helpers
 # ------------------------------------------------------------
 def _cross(a, b):
     return FreeCAD.Vector(
@@ -23,9 +23,8 @@ def _norm(v):
         raise ValueError("Cannot normalize zero vector")
     return FreeCAD.Vector(v.x/L, v.y/L, v.z/L)
 
-
 # ------------------------------------------------------------
-# wing cross‑section at Z (unchanged – for interior points)
+# wing cross‑section at Z
 # ------------------------------------------------------------
 def _get_wing_wires_at_z(wing_shape, z):
     try:
@@ -76,9 +75,8 @@ def _get_wing_wires_at_z(wing_shape, z):
     except Exception:
         return []
 
-
 # ------------------------------------------------------------
-# rib plane ∩ Z plane → line (for interior sampling)
+# rib plane ∩ Z plane → line
 # ------------------------------------------------------------
 def _rib_plane_intersect_z_plane(rib_center_line, plane_normal, z):
     start = rib_center_line.Vertexes[0].Point
@@ -109,9 +107,8 @@ def _rib_plane_intersect_z_plane(rib_center_line, plane_normal, z):
         pt = FreeCAD.Vector(0.0, rhs / n_rib.y, z)
     return pt, line_dir
 
-
 # ------------------------------------------------------------
-# clip line to wing cross‑section → segment (for interior points)
+# clip line to wing cross‑section → segment
 # ------------------------------------------------------------
 def _clip_line_to_wing_wires(point_on_line, line_dir, wires, max_len=2000.0):
     if not wires:
@@ -163,16 +160,14 @@ def _clip_line_to_wing_wires(point_on_line, line_dir, wires, max_len=2000.0):
                 best = (p1, p2, mid)
     return best
 
-
 # ------------------------------------------------------------
-# MAIN COLLECTION (corrected edge‑case detection)
+# MAIN COLLECTION
 # ------------------------------------------------------------
 def collect_rib_midpoints(wing_shape, rib_center_lines, plane_normal, z_min, z_max, z_step, doc=None, vis=False):
     data_by_rib = defaultdict(lambda: {'mid': [], 'edge_cases': []})
-    data_by_rib = defaultdict(lambda: {'mid': [], 'edge_cases': []})
     max_len = math.sqrt(wing_shape.BoundBox.XLength**2 + wing_shape.BoundBox.YLength**2) * 2
 
-    # 1) Regular horizontal sampling – collect midpoints (interior points)
+    # 1) Regular horizontal sampling – collect midpoints
     z = z_min
     slice_count = 0
     while z <= z_max + 1e-6:
@@ -218,7 +213,6 @@ def collect_rib_midpoints(wing_shape, rib_center_lines, plane_normal, z_min, z_m
             low_pts  = [p for p in vertices if abs(p.z - min_z) <= z_tol]
             high_pts = [p for p in vertices if abs(p.z - max_z) <= z_tol]
 
-            # Remove exact duplicates
             unique_low = []
             for p in low_pts:
                 if not any(p == q for q in unique_low):
@@ -249,20 +243,15 @@ def collect_rib_midpoints(wing_shape, rib_center_lines, plane_normal, z_min, z_m
                         unique_high.append(p)
                 data_by_rib[idx]['edge_cases'] = unique_low + unique_high
 
-    # 3) Merge edge cases into midpoints:
-    #    For low and high extremes, if there are multiple points, add their centroid (midpoint).
-    #    If only one point, add that point.
+    # 3) Merge edge cases into midpoints
     for idx, data in data_by_rib.items():
         if not data['edge_cases']:
             continue
-        # Group low and high by Z (approx)
         edge_pts = data['edge_cases']
-        # Find distinct Z groups (with tolerance)
         z_groups = {}
         for p in edge_pts:
-            z_key = round(p.z, 4)  # rounding to avoid floating issues
+            z_key = round(p.z, 4)
             z_groups.setdefault(z_key, []).append(p)
-        # For each Z group, compute centroid
         for z_key, pts in z_groups.items():
             if len(pts) == 1:
                 centroid = pts[0]
@@ -271,7 +260,6 @@ def collect_rib_midpoints(wing_shape, rib_center_lines, plane_normal, z_min, z_m
                 for p in pts:
                     centroid += p
                 centroid /= len(pts)
-            # Add centroid if not already in midpoints (within tolerance)
             already = any(centroid.isEqual(m, 1e-3) for m in data['mid'])
             if not already:
                 data['mid'].append(centroid)
@@ -319,10 +307,6 @@ def show_points_per_rib(data_by_rib, doc, mode='mid', prefix='RibPoints'):
     print(f"Visualized {count} ribs with {total} points (mode={mode}).")
 
 def create_rib_wires(data_by_rib, doc, vis=False):
-    """
-    Create wires (polylines) for each rib by connecting midpoints in Z order.
-    Returns a list of Part.Wire objects (or empty list).
-    """
     wires = []
     for idx, data in data_by_rib.items():
         pts = data['mid']
