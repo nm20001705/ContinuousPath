@@ -4,7 +4,46 @@ import trimesh
 import math
 import time
 import os
+import tempfile
 from functools import wraps
+
+# ============================================================
+# STEP EXPORTER (using cadquery)
+# ============================================================
+def export_to_step(mesh, path):
+    """
+    Export a trimesh mesh as a STEP file using cadquery.
+    Saves mesh to a temporary STL, imports it with cadquery, and exports to STEP.
+    Falls back to STL if cadquery is not available or import fails.
+    """
+    try:
+        import cadquery as cq
+        from cadquery import importers
+        # Write mesh to a temporary STL file
+        with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp:
+            tmp_stl = tmp.name
+        mesh.export(tmp_stl)
+        # Import STL using cadquery's importers
+        try:
+            # Newer versions: importers.importMesh
+            cq_object = importers.importMesh(tmp_stl)
+        except AttributeError:
+            # Older versions: importers.importStl
+            try:
+                cq_object = importers.importStl(tmp_stl)
+            except AttributeError:
+                # If neither works, fallback
+                raise ImportError("No suitable import function found in cadquery")
+        # Export to STEP
+        cq.exporters.export(cq_object, path)
+        os.unlink(tmp_stl)
+        print(f"  Exported STEP to {path}")
+    except Exception as e:
+        print(f"  STEP export failed: {e}")
+        # Fallback to STL with .stl extension
+        stl_path = path.rsplit('.', 1)[0] + '.stl'
+        mesh.export(stl_path)
+        print(f"  Saved STL as {stl_path}")
 
 # ============================================================
 # PROFILING
@@ -156,39 +195,25 @@ def create_rib_mesh(start, end, plane_normal, rib_width, y_extent):
     return box
 
 # ============================================================
-# EXACT FREECAD CUTOUT ALGORITHM (pure Python, trimesh)
+# CUTOUT FUNCTIONS
 # ============================================================
 def create_rectangular_cutout_from_boundary_mesh(boundary_pts, rib_width, plane_normal, margin, tol=1e-4):
-    """
-    Replicates FreeCAD's create_rectangular_cutout_from_boundary.
-    boundary_pts: list of 3D points (numpy arrays) on the rib plane, in order (closed loop).
-    Returns a trimesh.Trimesh (the cutout face) or None.
-    """
     if len(boundary_pts) < 4:
         return None
-
     pts = np.array(boundary_pts)
-
-    # 1. Group by Z to find min and max
     z_vals = pts[:,2]
     z_min = np.min(z_vals)
     z_max = np.max(z_vals)
-
     z_tol = 1e-4
     low_mask = np.abs(z_vals - z_min) <= z_tol
     high_mask = np.abs(z_vals - z_max) <= z_tol
     low_pts = pts[low_mask]
     high_pts = pts[high_mask]
-
     if len(low_pts) == 0 or len(high_pts) == 0:
         return None
-
     low_cent = np.mean(low_pts, axis=0)
     high_cent = np.mean(high_pts, axis=0)
-
     z_mid = (low_cent[2] + high_cent[2]) / 2.0
-
-    # 2. Find mid-height intersection points by interpolating along edges
     mid_pts = []
     n_pts = len(pts)
     for i in range(n_pts):
@@ -201,142 +226,159 @@ def create_rectangular_cutout_from_boundary_mesh(boundary_pts, rib_width, plane_
             x = p1[0] + t * (p2[0] - p1[0])
             y = p1[1] + t * (p2[1] - p1[1])
             mid_pts.append(np.array([x, y, z_mid]))
-
     if len(mid_pts) < 2:
         return None
-
-    # Remove duplicates
     uniq_mid = []
     for p in mid_pts:
         if not any(np.linalg.norm(p - q) < tol for q in uniq_mid):
             uniq_mid.append(p)
-
     if len(uniq_mid) < 2:
         return None
-
-    # Choose leftmost and rightmost (by X coordinate)
     left_mid = min(uniq_mid, key=lambda p: p[0])
     right_mid = max(uniq_mid, key=lambda p: p[0])
-
-    # 3. Four corners
     corners = np.array([low_cent, left_mid, high_cent, right_mid])
-
-    # 4. Shrink inward by margin
     centroid = np.mean(corners, axis=0)
-
     def shift_towards(pt, center, margin):
         dir_vec = pt - center
         norm = np.linalg.norm(dir_vec)
         if norm < 1e-6:
             return pt
         return pt - dir_vec / norm * margin
-
     shifted = np.array([shift_towards(p, centroid, margin) for p in corners])
-
-    # 5. Build a planar face (quad mesh)
     vertices = shifted
     faces = [[0, 1, 2, 3]]
     face_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     face_mesh.fix_normals()
-
-    # 6. Check that the face is inside the original boundary (optional)
-    # We could sample points and check containment, but we trust the algorithm.
-
     return face_mesh
 
 def create_prism_from_face(face_mesh, normal, height):
     """
-    Extrude a planar face along the normal by height to create a solid prism.
+    Extrude a planar face along its normal to create a watertight prism.
     """
-    # Use trimesh.creation.extrude_triangulation? But we have a quad face.
-    # We can build the bottom and top faces, then side faces.
+    # Ensure face is planar (we assume it is)
     vertices = face_mesh.vertices
-    faces = face_mesh.faces
-    # Ensure triangulated
-    if len(faces[0]) == 4:
-        faces = [faces[0][:3], [faces[0][0], faces[0][2], faces[0][3]]]
-    # Create bottom and top
-    bottom = vertices
-    top = vertices + normal * height
-    all_verts = np.vstack([bottom, top])
-    # Faces: bottom (existing), top (reverse order), sides
-    side_faces = []
-    n = len(bottom)
-    for i in range(n):
-        j = (i+1) % n
-        side_faces.append([i, j, n+j, n+i])
-    # Build mesh
-    mesh = trimesh.Trimesh(vertices=all_verts, faces=faces + side_faces, process=False)
-    mesh.fix_normals()
-    return mesh
+    if len(vertices) < 3:
+        return None
+
+    # Compute a local 2D coordinate system
+    origin = vertices[0]
+    # Use first edge as u‑axis
+    u = vertices[1] - origin
+    u = u / np.linalg.norm(u)
+    v = np.cross(normal, u)
+    if np.linalg.norm(v) < 1e-8:
+        v = np.cross(normal, [1,0,0])
+        if np.linalg.norm(v) < 1e-8:
+            v = np.cross(normal, [0,1,0])
+        v = v / np.linalg.norm(v)
+        u = np.cross(v, normal)
+        u = u / np.linalg.norm(u)
+
+    # Project vertices to 2D
+    coords_2d = []
+    for p in vertices:
+        dx = np.dot(p - origin, u)
+        dy = np.dot(p - origin, v)
+        coords_2d.append([dx, dy])
+    coords_2d = np.array(coords_2d)
+
+    # Order vertices to form a convex polygon (or use Shapely to handle ordering)
+    from shapely.geometry import Polygon as ShapelyPolygon
+    poly = ShapelyPolygon(coords_2d)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    ext_vertices = np.array(poly.exterior.coords)[:-1]  # remove repeated last point
+
+    # Map back to 3D
+    polygon_3d = []
+    for pt2d in ext_vertices:
+        x, y = pt2d
+        p3d = origin + x * u + y * v
+        polygon_3d.append(p3d)
+
+    # Create a path and extrude
+    path = trimesh.path.Path3D(
+        entities=[trimesh.path.entities.Line(np.arange(len(polygon_3d)+1))],
+        vertices=np.vstack([polygon_3d, polygon_3d[0]])
+    )
+    try:
+        extruded = trimesh.creation.extrude_polygon(path, height, transform=None)
+    except:
+        # Fallback: convex hull of the extruded vertices
+        bottom = polygon_3d
+        top = [p + normal * height for p in bottom]
+        all_verts = np.vstack([bottom, top])
+        extruded = trimesh.convex.convex_hull(all_verts)
+    return extruded
 
 # ============================================================
-# CREATE HOLED RIB UNION (accurate, fast)
+# CREATE HOLED RIB UNION (with STEP debug export)
 # ============================================================
 @timed
-def create_holed_rib_union(wing_mesh, rib_lines, params, plane_normal, rib_width, y_extent, margin, debug_dir=None):
-    import time
+def create_holed_rib_union(wing_mesh, rib_lines, params, plane_normal, rib_width, y_extent, margin, debug_dir=None, debug_format='step'):
     t0 = time.perf_counter()
 
-    # 1. Build rib union
+    # ---- Simplify wing mesh for slicing ----
+    print("  Simplifying wing mesh for slicing...")
+    t_simp = time.perf_counter()
+    wing_mesh_simple = wing_mesh.simplify_quadric_decimation(face_count=20000)
+    print(f"  Simplified mesh from {len(wing_mesh.faces)} to {len(wing_mesh_simple.faces)} faces in {time.perf_counter()-t_simp:.2f}s")
+
+    # ---- STEP 1: Build all rib meshes ----
+    print("  Building rib meshes...")
     t_start = time.perf_counter()
     rib_meshes = []
-    for start, end in rib_lines:
+    for idx, (start, end) in enumerate(rib_lines):
         m = create_rib_mesh(start, end, plane_normal, rib_width, y_extent)
         if m is not None:
             rib_meshes.append(m)
+        if (idx + 1) % 10 == 0:
+            print(f"    Built {idx + 1} rib meshes")
     if not rib_meshes:
         return None
+    print(f"  Built {len(rib_meshes)} rib meshes in {time.perf_counter() - t_start:.2f}s")
+
+    # ---- STEP 2: Union all rib meshes ----
+    print("  Unioning rib meshes...")
+    t_union = time.perf_counter()
     rib_union = rib_meshes[0]
     for m in rib_meshes[1:]:
         rib_union = rib_union.union(m)
-    print(f"  Rib union built in {time.perf_counter() - t_start:.2f}s")
+    print(f"  Rib union built in {time.perf_counter() - t_union:.2f}s")
 
     if not params.create_holes:
         return rib_union
 
-    # 2. Get boundary points for each rib
-    all_cutouts = []
+    # ---- STEP 3: Process each rib to create cutouts and subtract individually ----
     cutout_count = 0
-    total_slice_time = 0.0
-    total_cutout_face_time = 0.0
-    total_prism_time = 0.0
-    total_rib_loop_time = 0.0
+    print(f"  Processing cutouts, number of rib_lines = {len(rib_lines)}")
+    t_cutout_start = time.perf_counter()
 
-    total_ribs = len(rib_lines)
-    processed_ribs = 0
-    successful_cutouts = 0
-
-    t_loop_start = time.perf_counter()
-    
-    for idx, (start, end) in enumerate(rib_lines):
-        t_rib_start = time.perf_counter()
+    for rib_idx, (start, end) in enumerate(rib_lines):
         d = end - start
         length = np.linalg.norm(d)
         if length < 1e-8:
-            print(f"  Rib {idx}: zero length, skipping")
             continue
-
         d = d / length
         n_rib = np.cross(d, plane_normal)
         n_rib = n_rib / np.linalg.norm(n_rib)
         origin = start
 
-        # Accurate: plane-mesh intersection
-        t_slice_start = time.perf_counter()
+        # 3a: Plane-mesh intersection
+        t_slice = time.perf_counter()
         try:
-            result = trimesh.intersections.slice_mesh_plane(wing_mesh, plane_normal=n_rib, plane_origin=origin)
+            result = trimesh.intersections.slice_mesh_plane(wing_mesh_simple, plane_normal=n_rib, plane_origin=origin)
         except Exception as e:
-            print(f"  Rib {idx}: slice_mesh_plane failed: {e}")
+            print(f"  Rib {rib_idx}: slice_mesh_plane failed: {e}")
             continue
-        t_slice = time.perf_counter() - t_slice_start
-        total_slice_time += t_slice
+        t_slice = time.perf_counter() - t_slice
+        if t_slice > 0.1:
+            print(f"  Rib {rib_idx}: slice_mesh_plane took {t_slice:.2f}s")
 
         if result is None:
-            print(f"  Rib {idx}: slice_mesh_plane returned None")
             continue
 
-        # Extract line segments
+        # Extract segments
         segments = []
         if hasattr(result, 'vertices') and hasattr(result, 'edges'):
             for edge in result.edges:
@@ -354,102 +396,119 @@ def create_holed_rib_union(wing_mesh, rib_lines, params, plane_normal, rib_width
                     pass
 
         if not segments:
-            print(f"  Rib {idx}: no boundary segments found")
+            print(f"  Rib {rib_idx}: no boundary segments found")
             continue
 
-        # Collect all vertices
+        # Collect vertices
         boundary_pts = []
         for seg in segments:
             boundary_pts.append(seg[0])
             boundary_pts.append(seg[1])
 
         # Remove duplicates
-        unique = []
-        for p in boundary_pts:
-            if not any(np.linalg.norm(p - q) < 1e-3 for q in unique):
-                unique.append(p)
-
-        print(f"  Rib {idx}: segments={len(segments)}, boundary pts={len(boundary_pts)}, unique={len(unique)}")
+        pts_array = np.array(boundary_pts)
+        scaled = np.round(pts_array / 1e-3).astype(np.int64)
+        _, unique_indices = np.unique(scaled, axis=0, return_index=True)
+        unique = pts_array[np.sort(unique_indices)]
 
         if len(unique) < 4:
-            print(f"  Rib {idx}: not enough points for cutout (need >=4)")
+            print(f"  Rib {rib_idx}: not enough points for cutout (need >=4)")
             continue
 
-        # Compute cutout face
-        t_face_start = time.perf_counter()
+        # 3b: Create cutout face
+        t_face = time.perf_counter()
         cutout_face = create_rectangular_cutout_from_boundary_mesh(unique, rib_width, plane_normal, margin)
-        t_face = time.perf_counter() - t_face_start
-        total_cutout_face_time += t_face
-
+        t_face = time.perf_counter() - t_face
+        if t_face > 0.1:
+            print(f"  Rib {rib_idx}: face creation took {t_face:.2f}s")
         if cutout_face is None:
-            print(f"  Rib {idx}: cutout face creation failed")
+            print(f"  Rib {rib_idx}: cutout face creation failed")
             continue
 
-        # Extrude to solid
-        t_prism_start = time.perf_counter()
+        # 3c: Extrude to prism
+        t_prism = time.perf_counter()
         normal = n_rib
         height = rib_width * 1.05
         prism = create_prism_from_face(cutout_face, normal, height)
-        t_prism = time.perf_counter() - t_prism_start
-        total_prism_time += t_prism
+        t_prism = time.perf_counter() - t_prism
+        if t_prism > 0.1:
+            print(f"  Rib {rib_idx}: prism extrusion took {t_prism:.2f}s")
 
-        if prism is not None:
-            all_cutouts.append(prism)
-            cutout_count += 1
-            successful_cutouts += 1
-            if debug_dir:
+        if prism is None:
+            print(f"  Rib {rib_idx}: prism extrusion failed")
+            continue
+
+        # Validate volume and repair if needed
+        if not prism.is_volume:
+            repaired = trimesh.repair.fill_holes(prism)
+            if repaired is not None and repaired.is_volume:
+                prism = repaired
+            else:
+                # Try convex hull as last resort
                 try:
-                    prism.export(os.path.join(debug_dir, f"cutout_{idx}.stl"))
+                    hull = trimesh.convex.convex_hull(prism.vertices)
+                    if hull.is_volume:
+                        prism = hull
+                    else:
+                        print(f"  Rib {rib_idx}: cutout prism cannot be made a volume – skipping")
+                        continue
                 except:
-                    pass
-            print(f"  Rib {idx}: cutout created (slice={t_slice:.3f}s, face={t_face:.3f}s, prism={t_prism:.3f}s)")
-        else:
-            print(f"  Rib {idx}: prism extrusion failed")
+                    print(f"  Rib {rib_idx}: cutout prism cannot be made a volume – skipping")
+                    continue
 
-        processed_ribs += 1
-        t_rib_end = time.perf_counter()
-        total_rib_loop_time += t_rib_end - t_rib_start
-
-    print(f"\n  Summary for {processed_ribs} ribs processed:")
-    print(f"    Total slice_mesh_plane time: {total_slice_time:.2f}s")
-    print(f"    Total cutout face creation time: {total_cutout_face_time:.2f}s")
-    print(f"    Total prism extrusion time: {total_prism_time:.2f}s")
-    print(f"    Total rib loop time: {total_rib_loop_time:.2f}s")
-    print(f"    Successful cutouts: {successful_cutouts} out of {len(rib_lines)} ribs")
-
-    # 3. Fuse cutouts and subtract from rib union
-    if all_cutouts:
-        print("  Fusing cutouts...")
-        t_fuse_start = time.perf_counter()
-        cutout_union = all_cutouts[0]
-        for c in all_cutouts[1:]:
-            cutout_union = cutout_union.union(c)
-        t_fuse = time.perf_counter() - t_fuse_start
-        print(f"  Cutouts fused in {t_fuse:.2f}s")
-
-        if debug_dir:
-            try:
-                cutout_union.export(os.path.join(debug_dir, "all_cutouts.stl"))
-            except:
-                pass
-
-        print("  Subtracting holes from ribs...")
-        t_subtract_start = time.perf_counter()
+        # Now we have a volume, subtract it from rib_union directly
+        print(f"  Rib {rib_idx}: cutout created, subtracting from rib union...")
         try:
-            rib_union = trimesh.boolean.difference([rib_union, cutout_union], engine='manifold')
-            t_subtract = time.perf_counter() - t_subtract_start
-            print(f"  Subtraction completed in {t_subtract:.2f}s")
-            print("Successfully subtracted holes from ribs.")
+            # Try manifold engine first
+            rib_union = trimesh.boolean.difference([rib_union, prism], engine='manifold')
+            cutout_count += 1
+            if debug_dir:
+                ext = '.step' if debug_format.lower() == 'step' else '.stl'
+                try:
+                    if debug_format.lower() == 'step':
+                        export_to_step(prism, os.path.join(debug_dir, f"cutout_{rib_idx}.step"))
+                    else:
+                        prism.export(os.path.join(debug_dir, f"cutout_{rib_idx}.stl"))
+                except Exception as e:
+                    print(f"    Failed to export cutout {rib_idx}: {e}")
         except Exception as e:
-            print(f"Hole subtraction failed: {e}")
-    else:
-        print("No cutouts created.")
+            print(f"  Rib {rib_idx}: subtraction failed: {e}")
+
+    print(f"  Cutout processing took {time.perf_counter() - t_cutout_start:.2f}s")
+    print(f"Total cutouts subtracted: {cutout_count}")
+
+    # ---- Final repair of rib_union to ensure it's a volume ----
+    if not rib_union.is_volume:
+        print("  Repairing rib union to make it a volume...")
+        repaired = trimesh.repair.fill_holes(rib_union)
+        if repaired is not None and repaired.is_volume:
+            rib_union = repaired
+        else:
+            # Try convex hull (may change shape drastically)
+            try:
+                hull = trimesh.convex.convex_hull(rib_union.vertices)
+                if hull.is_volume:
+                    rib_union = hull
+                else:
+                    print("  Warning: rib union could not be made a volume.")
+            except:
+                print("  Warning: rib union could not be made a volume.")
+
+    if debug_dir:
+        # Export final rib_union with holes
+        try:
+            if debug_format.lower() == 'step':
+                export_to_step(rib_union, os.path.join(debug_dir, "rib_union_with_holes.step"))
+            else:
+                rib_union.export(os.path.join(debug_dir, "rib_union_with_holes.stl"))
+        except Exception as e:
+            print(f"  Failed to export final rib union: {e}")
 
     print(f"  Total time for create_holed_rib_union: {time.perf_counter() - t0:.2f}s")
     return rib_union
 
 # ============================================================
-# BRIDGES (unchanged)
+# BRIDGES
 # ============================================================
 def get_rib_boundary_z_range(wing_mesh, start, end, plane_normal, tol=1e-3):
     d = end - start
@@ -580,20 +639,24 @@ def main(params):
         else:
             rib_z_ranges.append(z_range)
 
-    # 3. Holed rib union (accurate)
+    # 3. Holed rib union (with STEP debug export)
     rib_union = create_holed_rib_union(wing_mesh, all_lines, params, params.plane_normal,
                                        params.rib_width, y_extent, params.cutout_margin,
-                                       debug_dir=debug_dir)
+                                       debug_dir=debug_dir, debug_format='step')
     if rib_union is None:
         print("No ribs generated – exiting.")
         return
 
-    # 4. Subtract ribs from wing
+    # 4. Subtract ribs from wing (only if rib_union is a volume and wing_mesh is watertight)
     print("Subtracting ribs from wing...")
-    try:
-        cut_wing = trimesh.boolean.difference([wing_mesh, rib_union], engine='manifold')
-    except Exception as e:
-        print(f"Boolean difference failed: {e}")
+    if rib_union.is_volume and wing_mesh.is_watertight:
+        try:
+            cut_wing = trimesh.boolean.difference([wing_mesh, rib_union], engine='manifold')
+        except Exception as e:
+            print(f"Boolean difference failed: {e}")
+            cut_wing = wing_mesh
+    else:
+        print("Skipping boolean difference: rib union or wing mesh is not watertight.")
         cut_wing = wing_mesh
 
     # 5. Bridges
@@ -606,6 +669,11 @@ def main(params):
         bridge_union = bridge_meshes[0]
         for m in bridge_meshes[1:]:
             bridge_union = bridge_union.union(m)
+        # Ensure bridge union is a volume
+        if not bridge_union.is_volume:
+            repaired = trimesh.repair.fill_holes(bridge_union)
+            if repaired is not None and repaired.is_volume:
+                bridge_union = repaired
         try:
             final_mesh = trimesh.boolean.union([cut_wing, bridge_union], engine='manifold')
         except Exception as e:
@@ -627,15 +695,15 @@ def main(params):
 # ============================================================
 if __name__ == "__main__":
     params = LWInfillParams(
-        input_stl_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\files\Fin.stl",
-        output_stl_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin_out.stl",
+        input_stl_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\WingR1_msv_orient.stl",
+        output_stl_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\WingR1_msv_out_orient.stl",
         rib_spacing=20.0,
         xy_rib_width=0.17,
         rib_angle=30.0,
         bridge_height=0.5,
         bridge_width=0.5,
         z_step=1.0,
-        cutout_margin=1.0,
+        cutout_margin=0.0,
         construction_plane='XZ',
         create_holes=True,
     )
