@@ -8,6 +8,69 @@ import tempfile
 from functools import wraps
 
 # ============================================================
+# MESH REPAIR (unchanged)
+# ============================================================
+def repair_mesh(mesh):
+    if mesh is None:
+        return None
+    if isinstance(mesh, trimesh.Scene):
+        meshes = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not meshes:
+            return None
+        if len(meshes) == 1:
+            mesh = meshes[0]
+        else:
+            mesh = trimesh.util.concatenate(meshes)
+            if mesh is None:
+                return None
+    if not isinstance(mesh, trimesh.Trimesh):
+        return None
+    if len(mesh.faces) == 0:
+        return None
+    try:
+        merged = mesh.merge_vertices()
+        if merged is not None:
+            mesh = merged
+    except:
+        pass
+    try:
+        mesh.remove_degenerate_faces()
+    except:
+        pass
+    try:
+        mesh.fix_normals()
+    except:
+        pass
+    for max_hole in [0.01, 0.05, 0.1, 0.5, 1.0]:
+        try:
+            repaired = trimesh.repair.fill_holes(mesh, max_hole=max_hole)
+            if repaired is not None and repaired.is_watertight:
+                mesh = repaired
+                break
+        except:
+            continue
+    try:
+        trimesh.repair.wind_watertight(mesh)
+    except:
+        pass
+    try:
+        trimesh.repair.broken_faces(mesh)
+    except:
+        pass
+    try:
+        mesh.fix_normals()
+    except:
+        pass
+    if not mesh.is_watertight:
+        try:
+            hull = trimesh.convex.convex_hull(mesh.vertices)
+            if hull.is_watertight:
+                mesh = hull
+        except:
+            pass
+    return mesh
+
+# ============================================================
 # STEP EXPORTER (using cadquery)
 # ============================================================
 def export_to_step(mesh, path):
@@ -599,22 +662,33 @@ def create_bridge_meshes(data_by_rib, plane_normal, rib_width, bridge_height, y_
 def main(params):
     if not params.input_stl_path:
         raise ValueError("input_stl_path must be provided")
-    wing_mesh = trimesh.load(params.input_stl_path)
-    if wing_mesh is None or not isinstance(wing_mesh, trimesh.Trimesh):
-        raise ValueError("Failed to load STL or loaded object is not a mesh")
 
-    # Repair mesh (soft)
-    original_mesh = wing_mesh
-    try:
-        if not wing_mesh.is_watertight:
-            repaired = trimesh.repair.fill_holes(wing_mesh)
-            if repaired is not None:
-                wing_mesh = repaired
-        wing_mesh = trimesh.repair.fix_normals(wing_mesh)
-        wing_mesh = wing_mesh.merge_vertices()
-    except Exception as e:
-        print(f"Warning: mesh repair failed ({e}), using original mesh")
-        wing_mesh = original_mesh
+    print("Loading mesh...")
+    loaded = trimesh.load(params.input_stl_path)
+
+    # If the loaded object is a Scene, extract the first mesh
+    if isinstance(loaded, trimesh.Scene):
+        meshes = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not meshes:
+            raise ValueError("No Trimesh found in the Scene")
+        wing_mesh = meshes[0]
+    else:
+        wing_mesh = loaded
+
+    if wing_mesh is None or not isinstance(wing_mesh, trimesh.Trimesh):
+        raise ValueError("Failed to load a valid Trimesh object")
+
+    print(f"Mesh vertices: {len(wing_mesh.vertices)}, faces: {len(wing_mesh.faces)}")
+    print(f"Is watertight: {wing_mesh.is_watertight}")
+    print(f"Is volume: {wing_mesh.is_volume}")
+
+    # Optional: minimal fix only if absolutely needed (but your mesh doesn't need it)
+    # if not wing_mesh.is_watertight:
+    #     repaired = trimesh.repair.fill_holes(wing_mesh)
+    #     if repaired is not None:
+    #         wing_mesh = repaired
+    #         wing_mesh.fix_normals()
+    #         wing_mesh.merge_vertices()
 
     debug_dir = os.path.dirname(params.output_stl_path)
     if debug_dir:
@@ -626,11 +700,9 @@ def main(params):
     y_max = bb[1,1]
     y_extent = (y_max - y_min) * 1.2
 
-    # 1. Grid lines
     lines1, lines2 = create_angled_grid_lines(bb, params)
     all_lines = lines1 + lines2
 
-    # 2. Rib Z ranges (for bridges)
     rib_z_ranges = []
     for start, end in all_lines:
         z_range = get_rib_boundary_z_range(wing_mesh, start, end, params.plane_normal)
@@ -639,7 +711,6 @@ def main(params):
         else:
             rib_z_ranges.append(z_range)
 
-    # 3. Holed rib union (with STEP debug export)
     rib_union = create_holed_rib_union(wing_mesh, all_lines, params, params.plane_normal,
                                        params.rib_width, y_extent, params.cutout_margin,
                                        debug_dir=debug_dir, debug_format='step')
@@ -647,42 +718,56 @@ def main(params):
         print("No ribs generated – exiting.")
         return
 
-    # 4. Subtract ribs from wing (only if rib_union is a volume and wing_mesh is watertight)
     print("Subtracting ribs from wing...")
     if rib_union.is_volume and wing_mesh.is_watertight:
         try:
             cut_wing = trimesh.boolean.difference([wing_mesh, rib_union], engine='manifold')
         except Exception as e:
             print(f"Boolean difference failed: {e}")
-            cut_wing = wing_mesh
+            try:
+                cut_wing = trimesh.boolean.difference([wing_mesh, rib_union], engine='scad')
+            except:
+                print("Scad fallback also failed; keeping original wing.")
+                cut_wing = wing_mesh
     else:
         print("Skipping boolean difference: rib union or wing mesh is not watertight.")
         cut_wing = wing_mesh
 
-    # 5. Bridges
     data_by_rib = collect_midpoints(all_lines, rib_z_ranges, params.z_step)
     bridge_meshes = create_bridge_meshes(data_by_rib, params.plane_normal,
                                          params.rib_width, params.bridge_height, y_extent)
 
     if bridge_meshes:
         print("Adding bridges...")
-        bridge_union = bridge_meshes[0]
-        for m in bridge_meshes[1:]:
-            bridge_union = bridge_union.union(m)
-        # Ensure bridge union is a volume
-        if not bridge_union.is_volume:
-            repaired = trimesh.repair.fill_holes(bridge_union)
-            if repaired is not None and repaired.is_volume:
-                bridge_union = repaired
-        try:
-            final_mesh = trimesh.boolean.union([cut_wing, bridge_union], engine='manifold')
-        except Exception as e:
-            print(f"Union failed: {e}")
+        bridge_union = None
+        for b in bridge_meshes:
+            if b.is_volume:
+                if bridge_union is None:
+                    bridge_union = b
+                else:
+                    try:
+                        bridge_union = trimesh.boolean.union([bridge_union, b], engine='manifold')
+                    except:
+                        try:
+                            bridge_union = trimesh.boolean.union([bridge_union, b], engine='scad')
+                        except:
+                            print("  Skipping a bridge due to union failure")
+                            continue
+        if bridge_union is not None:
+            try:
+                final_mesh = trimesh.boolean.union([cut_wing, bridge_union], engine='manifold')
+            except Exception as e:
+                print(f"Union failed: {e}")
+                try:
+                    final_mesh = trimesh.boolean.union([cut_wing, bridge_union], engine='scad')
+                except:
+                    print("Scad fallback failed; keeping wing without bridges.")
+                    final_mesh = cut_wing
+        else:
             final_mesh = cut_wing
     else:
         final_mesh = cut_wing
 
-    # 6. Export
     if params.output_stl_path:
         final_mesh.export(params.output_stl_path)
         print(f"Exported STL to {params.output_stl_path}")
@@ -695,8 +780,10 @@ def main(params):
 # ============================================================
 if __name__ == "__main__":
     params = LWInfillParams(
-        input_stl_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\WingR1_msv_orient.stl",
-        output_stl_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\WingR1_msv_out_orient.stl",
+        # input_stl_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\WingR1_msv_orient.stl",
+        # output_stl_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\WingR1_msv_out_orient.stl",
+        input_stl_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.stl",
+        output_stl_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin_out.stl",
         rib_spacing=20.0,
         xy_rib_width=0.17,
         rib_angle=30.0,
