@@ -14,6 +14,9 @@ from slab_utils import (
     clip_surfaces_to_solid, 
     build_rib_segments_analytical
 )
+
+from bridge_utils import create_bridges_analytical
+
 from viz_utils import fit_view, show_rib_centre_lines
 
 # ---- PLANE_DEFS and LWInfillParams (with create_holes) ----
@@ -44,7 +47,8 @@ class LWInfillParams:
                  vis_final_solid=True, vis_rect_cutouts=True,
                  create_holes=True, 
                  vis_rib_centre_surfaces_clip=True, 
-                 vis_rib_segments=True):
+                 vis_rib_segments=True, 
+                 bridge_height=0.4):
         if construction_plane not in PLANE_DEFS:
             raise ValueError(f"construction_plane must be one of {list(PLANE_DEFS.keys())}")
         self.nozzle_diameter = nozzle_diameter
@@ -76,6 +80,7 @@ class LWInfillParams:
         self.create_holes = create_holes
         self.vis_rib_centre_surfaces_clip=vis_rib_centre_surfaces_clip
         self.vis_rib_segments=vis_rib_segments
+        self.bridge_height=bridge_height
         if xy_rib_width:
             self.rib_width = xy_rib_width / math.sin(math.radians(90-rib_angle))
         else:
@@ -164,6 +169,17 @@ def main(params):
         vis=params.vis_rib_segments
     )
 
+    # Build bridges
+    bridge_mesh = create_bridges_analytical(
+        wing_mesh,
+        all_lines_np,
+        plane_normal_np,
+        z_step=0.2,              # vertical increment
+        bridge_height=params.bridge_height,       # half-length of bridge segment
+        doc=doc,
+        vis=True                 # or use a parameter from LWInfillParams
+    )
+
     # ---- Show centre lines if requested ----
     if params.vis_centre_lines:
         show_rib_centre_lines(all_center_lines_fc, doc)
@@ -183,6 +199,7 @@ if __name__ == "__main__":
         # obj_name='WingR1_msv_orient001_solid',
         nozzle_diameter=0.4,
         rib_spacing=20.0,
+        bridge_height = 0.4,
         xy_rib_width=0.13,
         rib_angle=30.0,
         grid_orientation=0.0,
