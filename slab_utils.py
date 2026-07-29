@@ -14,6 +14,7 @@ import trimesh
 import shapely.geometry as sg
 from shapely.ops import polygonize
 from functools import wraps
+from shapely.geometry import Polygon as ShapelyPolygon, LineString
 
 # ------------------------------------------------------------
 # Profiling (complete)
@@ -619,3 +620,395 @@ def merge_and_show_final_mesh(cut_wing_fc, bridges_fc, doc, vis=True):
         show_mesh(final_fc, doc, "FinalMesh", color=(0.8,0.8,0.8), transparency=50)
     end_op()
     return final_fc
+
+def create_rib_surfaces(wing_mesh, rib_lines, plane_normal):
+    surfaces = []
+    for start, end in rib_lines:
+        d = end - start
+        length = np.linalg.norm(d)
+        if length < 1e-8:
+            continue
+        d = d / length
+
+        rib_plane_normal = np.cross(d, plane_normal)
+        if np.linalg.norm(rib_plane_normal) < 1e-8:
+            continue
+        rib_plane_normal = rib_plane_normal / np.linalg.norm(rib_plane_normal)
+
+        try:
+            path = trimesh.intersections.slice_mesh_plane(
+                wing_mesh,
+                plane_normal=rib_plane_normal,
+                plane_origin=start
+            )
+        except Exception:
+            continue
+
+        if path is None or len(path.vertices) < 3:
+            continue
+
+        verts = path.vertices
+        edges = path.edges
+
+        # Local basis
+        u = verts[edges[0][1]] - verts[edges[0][0]]
+        u_norm = np.linalg.norm(u)
+        if u_norm < 1e-8:
+            u = np.cross(rib_plane_normal, [1, 0, 0])
+            if np.linalg.norm(u) < 1e-8:
+                u = np.cross(rib_plane_normal, [0, 1, 0])
+            u = u / np.linalg.norm(u)
+        else:
+            u = u / u_norm
+        v = np.cross(rib_plane_normal, u)
+        v = v / np.linalg.norm(v)
+
+        origin = verts[0]
+
+        coords_2d = []
+        for p in verts:
+            dx = np.dot(p - origin, u)
+            dy = np.dot(p - origin, v)
+            coords_2d.append((dx, dy))
+
+        lines_2d = []
+        for edge in edges:
+            p1 = coords_2d[edge[0]]
+            p2 = coords_2d[edge[1]]
+            lines_2d.append(sg.LineString([p1, p2]))
+
+        merged = sg.MultiLineString(lines_2d)
+        polygons = list(polygonize(merged))
+        if not polygons:
+            continue
+
+        # Select the largest polygon
+        poly = max(polygons, key=lambda p: p.area)
+        if poly.is_empty or poly.area < 1e-8:
+            continue
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+
+        # Triangulate the polygon directly
+        try:
+            verts_2d, faces = trimesh.creation.triangulate_polygon(poly)
+        except Exception as e:
+            print(f"  Triangulation failed for a rib: {e}")
+            continue
+
+        if len(verts_2d) < 3 or len(faces) == 0:
+            continue
+
+        # Map to 3D
+        verts_3d = []
+        for (x2d, y2d) in verts_2d:
+            pt = origin + x2d * u + y2d * v
+            verts_3d.append(pt)
+
+        face_mesh = trimesh.Trimesh(vertices=verts_3d, faces=faces)
+        if face_mesh is not None and len(face_mesh.vertices) > 0:
+            face_mesh.fix_normals()
+            surfaces.append(face_mesh)
+
+    return surfaces
+
+
+def create_rib_centre_surfaces(wing_shape, rib_center_lines, plane_normal, doc, vis=False, tol=1e-4):
+    """
+    Returns (faces, edges).
+    faces: list of Part.Face — one for each closed region (including holes)
+    edges: list of Part.Edge — all raw intersection edges
+    """
+    faces = []
+    all_edges = []
+
+    for line in rib_center_lines:
+        start = line.Vertexes[0].Point
+        end   = line.Vertexes[-1].Point
+        rib_dir = (end - start).normalize()
+        n_rib = rib_dir.cross(plane_normal).normalize()
+        plane = Part.Plane(start, n_rib)
+        try:
+            intersect = wing_shape.section(plane)
+            if not intersect or not intersect.Edges:
+                continue
+            edges = list(intersect.Edges)
+            all_edges.extend(edges)
+
+            # ---- Build all closed wires by edge stitching ----
+            used = [False] * len(edges)
+            wires = []
+            for i in range(len(edges)):
+                if used[i]:
+                    continue
+                # Start a new wire
+                loop = [edges[i]]
+                used[i] = True
+                cur_end = edges[i].Vertexes[-1].Point
+                changed = True
+                while changed:
+                    changed = False
+                    for j, e in enumerate(edges):
+                        if used[j]:
+                            continue
+                        if e.Vertexes[0].Point.isEqual(cur_end, tol):
+                            loop.append(e)
+                            used[j] = True
+                            cur_end = e.Vertexes[-1].Point
+                            changed = True
+                            break
+                        elif e.Vertexes[-1].Point.isEqual(cur_end, tol):
+                            rev = e.copy()
+                            rev.reverse()
+                            loop.append(rev)
+                            used[j] = True
+                            cur_end = e.Vertexes[0].Point
+                            changed = True
+                            break
+                # Close the wire
+                if len(loop) > 1:
+                    try:
+                        wire = Part.Wire(loop)
+                        wires.append(wire)
+                    except:
+                        continue
+
+            # For each closed wire, create a face. We will not attempt to detect nesting; just create faces.
+            # If there is nesting, some faces may be holes, but they will be separate objects.
+            # That's acceptable for visualisation and further processing.
+            for wire in wires:
+                if wire.isClosed() and not wire.isNull():
+                    try:
+                        face = Part.Face(wire)
+                        if face.isValid():
+                            faces.append(face)
+                    except:
+                        # Fallback: try to create face with tolerance
+                        try:
+                            face = Part.Face(wire, tolerance=tol)
+                            if face.isValid():
+                                faces.append(face)
+                        except:
+                            continue
+        except Exception:
+            continue
+    if vis:
+        from viz_utils import show_rib_centre_surfaces, show_rib_centre_edges
+        show_rib_centre_surfaces(faces, doc, color=(0.8, 0.4, 0.8), transparency=50)
+        print(f"Created {len(faces)} rib centre surfaces.")
+        show_rib_centre_edges(edges, doc, line_color=(0.2, 0.5, 1.0), line_width=2)
+        print(f"Created {len(edges)} rib centre edges.")
+    return faces, all_edges
+
+def create_rib_surfaces_trimesh(wing_mesh, rib_center_lines_np, plane_normal_np, doc=None, vis=False):
+    """
+    Create flat rectangular surfaces for each rib line, spanning the wing's bounding box.
+    No slicing – just pure visualization of the rib planes.
+    """
+    surfaces = []
+    print(f"Creating {len(rib_center_lines_np)} rib planes...")
+
+    # Get wing bounding box
+    bbox = wing_mesh.bounds  # [[minx, miny, minz], [maxx, maxy, maxz]]
+    min_pt = bbox[0]
+    max_pt = bbox[1]
+    # Approximate size for the rectangle (use diagonal of bbox)
+    diag = np.linalg.norm(max_pt - min_pt)
+
+    for i, (start, end) in enumerate(rib_center_lines_np):
+        origin = (start + end) / 2.0
+        rib_dir = end - start
+        length = np.linalg.norm(rib_dir)
+        if length < 1e-8:
+            continue
+        rib_dir /= length
+
+        # Plane normal: perpendicular to rib_dir and construction normal
+        plane_normal = np.cross(rib_dir, plane_normal_np)
+        norm = np.linalg.norm(plane_normal)
+        if norm < 1e-8:
+            continue
+        plane_normal /= norm
+
+        # Build an orthonormal basis for the plane
+        ref = np.array([1., 0., 0.])
+        if abs(plane_normal[0]) > 0.9:
+            ref = np.array([0., 1., 0.])
+        u = np.cross(plane_normal, ref)
+        u /= np.linalg.norm(u)
+        v = np.cross(plane_normal, u)
+
+        # Create a rectangular patch (size = diag * 0.8 to fit within bbox)
+        half = diag * 0.5
+        corners = [
+            origin - half * u - half * v,
+            origin + half * u - half * v,
+            origin + half * u + half * v,
+            origin - half * u + half * v
+        ]
+        # Build a simple quad mesh (2 triangles)
+        verts = np.array(corners)
+        faces = np.array([[0, 1, 2], [0, 2, 3]])
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces)
+        surfaces.append(mesh)
+        print(f"Rib {i}: rectangle created")
+
+    print(f"Total surfaces created: {len(surfaces)}")
+
+    # ---- Visualise if requested ----
+    if vis and doc and surfaces:
+        try:
+            from viz_utils import show_mesh
+            from slab_utils import trimesh_to_freecad
+            combined = trimesh.util.concatenate(surfaces)
+            fc_mesh = trimesh_to_freecad(combined)
+            if fc_mesh:
+                show_mesh(fc_mesh, doc, "RibSurfaces", color=(0.2, 0.6, 1.0), transparency=40)
+                doc.recompute()
+                print("Rib surfaces visualised in FreeCAD.")
+        except Exception as e:
+            print(f"Visualisation error: {e}")
+
+    return surfaces
+
+def clip_surfaces_to_solid(rib_center_lines_np, wing_mesh, plane_normal_np,
+                           doc=None, vis=False):
+    """
+    Create the exact rib cross-section surfaces by intersecting the wing mesh
+    with each rib plane.
+
+    Returns
+    -------
+    clipped : list[trimesh.Trimesh]
+        Planar triangulated meshes representing the clipped rib surfaces.
+    """
+
+    clipped = []
+
+    print(f"Clipping {len(rib_center_lines_np)} rib planes against wing...")
+
+    for i, (start, end) in enumerate(rib_center_lines_np):
+
+        # ------------------------------------------------------------------
+        # Rib plane
+        # ------------------------------------------------------------------
+        origin = (start + end) * 0.5
+
+        rib_dir = end - start
+        L = np.linalg.norm(rib_dir)
+        if L < 1e-8:
+            continue
+        rib_dir /= L
+
+        rib_plane_normal = np.cross(rib_dir, plane_normal_np)
+        nL = np.linalg.norm(rib_plane_normal)
+        if nL < 1e-8:
+            continue
+        rib_plane_normal /= nL
+
+        # ------------------------------------------------------------------
+        # Exact section curve (no cutting of the mesh)
+        # ------------------------------------------------------------------
+        try:
+            section = wing_mesh.section(
+                plane_origin=origin,
+                plane_normal=rib_plane_normal
+            )
+        except Exception as e:
+            print(f"Plane {i}: section failed: {e}")
+            continue
+
+        if section is None:
+            print(f"Plane {i}: no intersection")
+            continue
+
+        # ------------------------------------------------------------------
+        # Convert to planar coordinates
+        # ------------------------------------------------------------------
+        try:
+            planar, to_3d = section.to_planar()
+        except Exception as e:
+            print(f"Plane {i}: to_planar failed: {e}")
+            continue
+
+        # planar is a Path2D
+        polygons = planar.polygons_full
+
+        if not polygons:
+            print(f"Plane {i}: no closed polygons")
+            continue
+
+        rib_meshes = []
+
+        # ------------------------------------------------------------------
+        # Triangulate each polygon and transform back to 3D
+        # ------------------------------------------------------------------
+        for poly in polygons:
+
+            if poly.is_empty or poly.area < 1e-8:
+                continue
+
+            try:
+                verts2d, faces = trimesh.creation.triangulate_polygon(poly)
+            except Exception as e:
+                print(f"Plane {i}: triangulation failed: {e}")
+                continue
+
+            if len(verts2d) == 0 or len(faces) == 0:
+                continue
+
+            # Homogeneous 2D -> 3D transform
+            verts_h = np.column_stack([
+                verts2d,
+                np.zeros(len(verts2d)),
+                np.ones(len(verts2d))
+            ])
+
+            verts3d = (to_3d @ verts_h.T).T[:, :3]
+
+            mesh = trimesh.Trimesh(
+                vertices=verts3d,
+                faces=faces,
+                process=False
+            )
+
+            mesh.fix_normals()
+            rib_meshes.append(mesh)
+
+        if not rib_meshes:
+            continue
+
+        rib_mesh = trimesh.util.concatenate(rib_meshes)
+        clipped.append(rib_mesh)
+
+        print(f"Plane {i}: clipped surface created ({len(rib_mesh.vertices)} verts)")
+
+    print(f"Total clipped surfaces created: {len(clipped)}")
+
+    # ----------------------------------------------------------------------
+    # Visualise
+    # ----------------------------------------------------------------------
+    if vis and doc and clipped:
+
+        try:
+            from viz_utils import show_mesh
+
+            combined = trimesh.util.concatenate(clipped)
+            fc_mesh = trimesh_to_freecad(combined)
+
+            if fc_mesh:
+                show_mesh(
+                    fc_mesh,
+                    doc,
+                    "ClippedRibSurfaces",
+                    color=(0.8, 0.2, 0.2),
+                    transparency=20
+                )
+
+                doc.recompute()
+                print("Clipped rib surfaces visualised in FreeCAD.")
+
+        except Exception as e:
+            print(f"Visualisation error: {e}")
+
+    return clipped
