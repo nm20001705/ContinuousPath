@@ -27,3 +27,13 @@ first we try to find the lowest and the highest  point(s) in the z direction of 
 lets try to go stpe by step. i suggest we firrst create the slabs, the bridges and holes, only as surfaces. we can then gut the slab surfaces with the hole surface snd the bridge surfaces. this gives us the internal structure which we can extrude, to give us a thickness. 
 
 we now simplyfy first the code such that it only creates the slabs as surfaces, that are already cut to the wing. 
+
+
+
+what this gode is supposed to do:
+create an internal structure (ribs) of the solid as a mesh. 
+i have two sets of ribs that intersect each other. 
+I need ne cut the ribs with each other and get the parts of the ribs. 
+
+
+

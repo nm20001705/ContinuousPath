@@ -1,14 +1,9 @@
 # main.py – fully optimised using trimesh for everything
 
 import FreeCAD
-import FreeCADGui
 import Part
-import Mesh
 import math
-import tempfile
-import os
 import numpy as np
-import trimesh
 
 # ---- Import only needed functions from our modules ----
 # ---- Import the new function ----
@@ -16,10 +11,10 @@ from slab_utils import (
     create_rib_surfaces_trimesh,
     shape_to_trimesh, 
     create_angled_grid_lines,
-    trimesh_to_freecad, 
-    clip_surfaces_to_solid
+    clip_surfaces_to_solid, 
+    build_rib_segments_analytical
 )
-from viz_utils import fit_view, show_mesh, show_rib_centre_lines
+from viz_utils import fit_view, show_rib_centre_lines
 
 # ---- PLANE_DEFS and LWInfillParams (with create_holes) ----
 PLANE_DEFS = {
@@ -48,7 +43,8 @@ class LWInfillParams:
                  vis_rib_surface_segments=True,
                  vis_final_solid=True, vis_rect_cutouts=True,
                  create_holes=True, 
-                 vis_rib_centre_surfaces_clip=True):
+                 vis_rib_centre_surfaces_clip=True, 
+                 vis_rib_segments=True):
         if construction_plane not in PLANE_DEFS:
             raise ValueError(f"construction_plane must be one of {list(PLANE_DEFS.keys())}")
         self.nozzle_diameter = nozzle_diameter
@@ -79,6 +75,7 @@ class LWInfillParams:
         self.vis_rect_cutouts = vis_rect_cutouts
         self.create_holes = create_holes
         self.vis_rib_centre_surfaces_clip=vis_rib_centre_surfaces_clip
+        self.vis_rib_segments=vis_rib_segments
         if xy_rib_width:
             self.rib_width = xy_rib_width / math.sin(math.radians(90-rib_angle))
         else:
@@ -148,12 +145,23 @@ def main(params):
     print(f"Created {len(rib_faces)} rib centre faces")
 
     # ---- Get the exact rib cross‑sections ----
-    clipped_ribs = clip_surfaces_to_solid(
+    clipped_ribs, rib_indices = clip_surfaces_to_solid(
         all_lines_np,               # rib centerlines (numpy arrays)
         wing_mesh,                  # the wing mesh
         plane_normal_np,            # construction plane normal
         doc=doc,
         vis=params.vis_rib_centre_surfaces_clip
+    )
+
+    active_lines = [all_lines_np[i] for i in rib_indices]
+
+    # Now split
+    rib_segments = build_rib_segments_analytical(
+        wing_mesh,
+        all_lines_np,
+        plane_normal_np,
+        doc=doc,
+        vis=params.vis_rib_segments
     )
 
     # ---- Show centre lines if requested ----
@@ -182,16 +190,17 @@ if __name__ == "__main__":
         primary_dir=FreeCAD.Vector(0, 0, 1),
         construction_plane='XZ',
         vis_cut_wing=False,
-        vis_centre_lines=True,
+        vis_centre_lines=False,
         vis_midpoints=False,
         vis_wires=False,
         vis_bridges=False,
-        vis_rib_centre_surfaces=True,
-        vis_rib_centre_surfaces_clip=True,
+        vis_rib_centre_surfaces=False,
+        vis_rib_centre_surfaces_clip=False,
         vis_rib_surface_segments=False,
-        vis_final_solid=True,
+        vis_final_solid=False,
         vis_rect_cutouts=True,
         cutout_marging=0,
-        create_holes=False   # set to True if you want cutouts
+        create_holes=False,    # set to True if you want cutouts
+        vis_rib_segments = True
     )
     main(params)

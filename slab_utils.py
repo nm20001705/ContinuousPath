@@ -15,7 +15,10 @@ import shapely.geometry as sg
 from shapely.ops import polygonize
 from functools import wraps
 from shapely.geometry import Polygon as ShapelyPolygon, LineString
-
+import trimesh.path.polygons
+from shapely.ops import split
+from shapely.geometry import Polygon as ShapelyPolygon, LineString
+from viz_utils import show_mesh
 # ------------------------------------------------------------
 # Profiling (complete)
 # ------------------------------------------------------------
@@ -163,9 +166,6 @@ def trimesh_to_freecad(mesh):
     os.unlink(tmp_stl)
     return fc_mesh
 
-# ------------------------------------------------------------
-# Fast grid generation – all numpy (fixed TypeError)
-# ------------------------------------------------------------
 def create_angled_grid_lines(bb, params):
     """
     Returns two lists of (start, end) tuples, each a numpy array of shape (3,).
@@ -237,568 +237,6 @@ def create_angled_grid_lines(bb, params):
         return lines
 
     return generate_lines(d1), generate_lines(d2)
-
-# ------------------------------------------------------------
-# Rib and bridge creation (from your pure Python script)
-# ------------------------------------------------------------
-def create_rib_mesh(start, end, plane_normal, rib_width, y_extent):
-    d = end - start
-    length = np.linalg.norm(d)
-    if length < 1e-8:
-        return None
-    d = d / length
-    n_rib = np.cross(d, plane_normal)
-    n_rib = n_rib / np.linalg.norm(n_rib)
-    box = trimesh.creation.box(extents=[length, rib_width, y_extent])
-    rot = np.eye(3)
-    rot[:,0] = d
-    rot[:,1] = n_rib
-    rot[:,2] = plane_normal
-    centre = (start + end) / 2.0
-    T = np.eye(4)
-    T[:3,:3] = rot
-    T[:3,3] = centre - rot @ np.array([0,0,0])
-    box.apply_transform(T)
-    return box
-
-def get_rib_boundary_z_range(wing_mesh, start, end, plane_normal, tol=1e-3):
-    d = end - start
-    length = np.linalg.norm(d)
-    if length < 1e-6:
-        return None
-    d = d / length
-    z_min = None
-    z_max = None
-    pts = [start + d * t * length for t in np.linspace(0, 1, 101)]
-    contains = wing_mesh.contains(pts)
-    for i, pt in enumerate(pts):
-        if contains[i]:
-            if z_min is None or pt[2] < z_min:
-                z_min = pt[2]
-            if z_max is None or pt[2] > z_max:
-                z_max = pt[2]
-    if z_min is not None and z_max is not None:
-        return z_min, z_max
-    return None
-
-def create_holed_rib_union(wing_mesh, rib_lines, params, plane_normal, rib_width, y_extent, margin, debug_dir=None):
-    log("  Building rib meshes...")
-    rib_meshes = []
-    for idx, (start, end) in enumerate(rib_lines):
-        m = create_rib_mesh(start, end, plane_normal, rib_width, y_extent)
-        if m is not None:
-            rib_meshes.append(m)
-    if not rib_meshes:
-        return None
-    log(f"  Unioning {len(rib_meshes)} ribs...")
-    rib_union = rib_meshes[0]
-    for m in rib_meshes[1:]:
-        try:
-            rib_union = trimesh.boolean.union([rib_union, m], engine='manifold')
-        except:
-            try:
-                rib_union = trimesh.boolean.union([rib_union, m], engine='scad')
-            except:
-                print("  Skipping a rib due to union failure")
-                continue
-    if not params.create_holes:
-        return rib_union
-
-    # ---- Cutouts ----
-    log("  Generating cutouts...")
-    wing_simple = wing_mesh.simplify_quadric_decimation(face_count=20000)
-    cutout_prisms = []
-    for idx, (start, end) in enumerate(rib_lines):
-        d = end - start
-        length = np.linalg.norm(d)
-        if length < 1e-8:
-            continue
-        d = d / length
-        n_rib = np.cross(d, plane_normal)
-        n_rib = n_rib / np.linalg.norm(n_rib)
-        origin = start
-
-        try:
-            path = trimesh.intersections.slice_mesh_plane(wing_simple, plane_normal=n_rib, plane_origin=origin)
-        except:
-            continue
-        if path is None or len(path.vertices) < 3:
-            continue
-
-        verts = path.vertices
-        edges = path.edges
-        u = verts[edges[0][1]] - verts[edges[0][0]]
-        u_norm = np.linalg.norm(u)
-        if u_norm < 1e-8:
-            u = np.cross(n_rib, [1,0,0])
-            if np.linalg.norm(u) < 1e-8:
-                u = np.cross(n_rib, [0,1,0])
-            u = u / np.linalg.norm(u)
-        else:
-            u = u / u_norm
-        v = np.cross(n_rib, u)
-        v = v / np.linalg.norm(v)
-
-        coords_2d = []
-        for p in verts:
-            dx = np.dot(p - origin, u)
-            dy = np.dot(p - origin, v)
-            coords_2d.append((dx, dy))
-
-        lines_2d = []
-        for edge in edges:
-            p1 = coords_2d[edge[0]]
-            p2 = coords_2d[edge[1]]
-            lines_2d.append(sg.LineString([p1, p2]))
-        merged = sg.MultiLineString(lines_2d)
-        polygons = list(polygonize(merged))
-        if not polygons:
-            continue
-        poly = max(polygons, key=lambda p: p.area)
-        if poly.is_empty or poly.area < 1e-8:
-            continue
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-
-        height = rib_width * 1.05
-        transform = np.eye(4)
-        transform[:3,:3] = np.column_stack([u, v, n_rib])
-        transform[:3,3] = origin
-
-        try:
-            extruded = trimesh.creation.extrude_polygon(poly, height, transform=transform)
-        except:
-            continue
-        if extruded is None or not extruded.is_volume:
-            continue
-        cutout_prisms.append(extruded)
-
-    if cutout_prisms:
-        log(f"  Unioning {len(cutout_prisms)} cutouts...")
-        cutout_union = cutout_prisms[0]
-        for cp in cutout_prisms[1:]:
-            try:
-                cutout_union = trimesh.boolean.union([cutout_union, cp], engine='manifold')
-            except:
-                try:
-                    cutout_union = trimesh.boolean.union([cutout_union, cp], engine='scad')
-                except:
-                    print("  Skipping a cutout due to union failure")
-                    continue
-        if cutout_union.is_volume and rib_union.is_volume:
-            log("  Subtracting cutouts from ribs...")
-            try:
-                rib_union = trimesh.boolean.difference([rib_union, cutout_union], engine='manifold')
-            except:
-                try:
-                    rib_union = trimesh.boolean.difference([rib_union, cutout_union], engine='scad')
-                except:
-                    print("  Cutout subtraction failed – skipping holes.")
-    return rib_union
-
-def collect_midpoints(rib_lines, rib_z_ranges, z_step):
-    data_by_rib = {}
-    for idx, (start, end) in enumerate(rib_lines):
-        z_min, z_max = rib_z_ranges[idx]
-        if z_min is None or z_max is None:
-            continue
-        d = end - start
-        length = np.linalg.norm(d)
-        if length < 1e-8:
-            continue
-        d = d / length
-        z_start = start[2]
-        z_end = end[2]
-        z_low = max(z_start, z_min) if z_start < z_end else max(z_end, z_min)
-        z_high = min(z_start, z_max) if z_start > z_end else min(z_end, z_max)
-        if z_high - z_low < 1e-6:
-            continue
-        points = []
-        z = z_low
-        while z <= z_high + 1e-6:
-            t = (z - start[2]) / (end[2] - start[2]) if abs(end[2] - start[2]) > 1e-8 else 0
-            pt = start + t * (end - start)
-            points.append((z, pt))
-            z += z_step
-        for z_bound in (z_min, z_max):
-            t = (z_bound - start[2]) / (end[2] - start[2]) if abs(end[2] - start[2]) > 1e-8 else 0
-            pt = start + t * (end - start)
-            if not any(abs(z_bound - p[0]) < 1e-4 for p in points):
-                points.append((z_bound, pt))
-        points.sort(key=lambda x: x[0])
-        data_by_rib[idx] = points
-    return data_by_rib
-
-def create_bridge_meshes(data_by_rib, plane_normal, rib_width, bridge_height):
-    bridges = []
-    for idx, pts in data_by_rib.items():
-        if len(pts) < 2:
-            continue
-        for i in range(len(pts)-1):
-            p1 = pts[i][1]
-            p2 = pts[i+1][1]
-            d = p2 - p1
-            length = np.linalg.norm(d)
-            if length < 1e-8:
-                continue
-            d = d / length
-            n_rib = np.cross(d, plane_normal)
-            n_rib = n_rib / np.linalg.norm(n_rib)
-            box = trimesh.creation.box(extents=[length, rib_width, bridge_height])
-            rot = np.eye(3)
-            rot[:,0] = d
-            rot[:,1] = n_rib
-            rot[:,2] = plane_normal
-            centre = (p1 + p2) / 2.0
-            T = np.eye(4)
-            T[:3,:3] = rot
-            T[:3,3] = centre - rot @ np.array([0,0,0])
-            box.apply_transform(T)
-            bridges.append(box)
-    return bridges
-
-# ------------------------------------------------------------
-# Main fast pipeline (manual profiling)
-# ------------------------------------------------------------
-def create_cut_result_mesh(wing_shape, params, doc, vis_cut_wing=False, vis_centre_lines=False, cutout_faces=None):
-    start_op("create_cut_result_mesh")
-    # Convert wing shape to trimesh
-    wing_mesh = shape_to_trimesh(wing_shape, deflection=0.5, angular=0.5)
-    if wing_mesh is None:
-        raise RuntimeError("Failed to convert wing to trimesh")
-
-    bb = wing_shape.BoundBox
-
-    # 1. Grid lines (numpy arrays)
-    lines1, lines2 = create_angled_grid_lines(bb, params)
-    all_lines = lines1 + lines2  # list of (start, end) tuples
-
-    # Convert to FreeCAD lines for visualisation and later use
-    all_center_lines = []
-    for start, end in all_lines:
-        line = Part.makeLine(FreeCAD.Vector(*start), FreeCAD.Vector(*end))
-        all_center_lines.append(line)
-
-    # 2. Rib union with holes
-    y_extent = (bb.YMax - bb.YMin) * 1.2
-    rib_union = create_holed_rib_union(wing_mesh, all_lines, params,
-                                       params.plane_normal, params.rib_width,
-                                       y_extent, params.cutout_marging)
-    if rib_union is None:
-        print("No ribs generated – returning original wing.")
-        end_op()
-        return trimesh_to_freecad(wing_mesh), all_center_lines, []
-
-    # 3. Subtract ribs from wing
-    if wing_mesh.is_watertight and rib_union.is_volume:
-        try:
-            cut_wing = trimesh.boolean.difference([wing_mesh, rib_union], engine='manifold')
-        except:
-            try:
-                cut_wing = trimesh.boolean.difference([wing_mesh, rib_union], engine='scad')
-            except:
-                cut_wing = wing_mesh
-    else:
-        cut_wing = wing_mesh
-
-    # 4. Convert to FreeCAD mesh for visualisation
-    cut_wing_fc = trimesh_to_freecad(cut_wing)
-    if vis_cut_wing:
-        from viz_utils import show_mesh
-        show_mesh(cut_wing_fc, doc, "CutWingMesh", transparency=80)
-
-    if vis_centre_lines:
-        from viz_utils import show_rib_centre_lines
-        show_rib_centre_lines(all_center_lines, doc)
-
-    end_op()
-    return cut_wing_fc, all_center_lines, [rib_union]
-
-def create_bridges_trimmed_to_wing_mesh(data_by_rib, rib_center_lines, plane_normal,
-                                        rib_width, bridge_height, wing_mesh,
-                                        extend_length=5.0, doc=None, vis=False):
-    start_op("create_bridges_trimmed_to_wing_mesh")
-    # Convert FreeCAD lines to numpy points
-    rib_lines = []
-    for line in rib_center_lines:
-        start = np.array(line.Vertexes[0].Point)
-        end = np.array(line.Vertexes[-1].Point)
-        rib_lines.append((start, end))
-
-    # Convert data_by_rib (from point_utils) to our format: (z, point)
-    bridge_data = {}
-    for idx, data in data_by_rib.items():
-        pts = [np.array(p) for p in data['mid']]
-        if len(pts) < 2:
-            continue
-        pts_sorted = sorted(pts, key=lambda p: p[2])
-        if len(pts_sorted) >= 2:
-            dir0 = pts_sorted[1] - pts_sorted[0]
-            dir0 = dir0 / np.linalg.norm(dir0)
-            p_before = pts_sorted[0] - dir0 * extend_length
-            dir_last = pts_sorted[-1] - pts_sorted[-2]
-            dir_last = dir_last / np.linalg.norm(dir_last)
-            p_after = pts_sorted[-1] + dir_last * extend_length
-            pts_extended = [p_before] + pts_sorted + [p_after]
-        else:
-            continue
-        bridge_data[idx] = [(p[2], p) for p in pts_extended]
-
-    bridge_meshes = create_bridge_meshes(bridge_data, plane_normal, rib_width, bridge_height)
-    if not bridge_meshes:
-        end_op()
-        return None
-
-    # Union all bridges
-    bridge_union = bridge_meshes[0]
-    for bm in bridge_meshes[1:]:
-        try:
-            bridge_union = trimesh.boolean.union([bridge_union, bm], engine='manifold')
-        except:
-            try:
-                bridge_union = trimesh.boolean.union([bridge_union, bm], engine='scad')
-            except:
-                print("  Skipping a bridge union due to failure")
-                continue
-
-    # Intersect with wing mesh (if wing_mesh is provided as trimesh)
-    if wing_mesh is not None:
-        try:
-            trimmed = bridge_union.intersection(wing_mesh, engine='manifold')
-        except:
-            try:
-                trimmed = bridge_union.intersection(wing_mesh, engine='scad')
-            except:
-                trimmed = bridge_union
-        bridge_union = trimmed
-
-    if vis:
-        from viz_utils import show_mesh
-        fc_mesh = trimesh_to_freecad(bridge_union)
-        if fc_mesh:
-            show_mesh(fc_mesh, doc, "BridgesMesh", color=(0.0,0.8,0.0), transparency=30)
-
-    end_op()
-    return trimesh_to_freecad(bridge_union)
-
-def merge_and_show_final_mesh(cut_wing_fc, bridges_fc, doc, vis=True):
-    start_op("merge_and_show_final_mesh")
-    if bridges_fc is None or bridges_fc.CountFacets == 0:
-        final_fc = cut_wing_fc
-    else:
-        with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp1:
-            tmp1_stl = tmp1.name
-        with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp2:
-            tmp2_stl = tmp2.name
-        try:
-            cut_wing_fc.write(tmp1_stl)
-            bridges_fc.write(tmp2_stl)
-            tm1 = trimesh.load(tmp1_stl, force='mesh')
-            tm2 = trimesh.load(tmp2_stl, force='mesh')
-            if tm1 and tm2:
-                try:
-                    final_tm = trimesh.boolean.union([tm1, tm2], engine='manifold')
-                except:
-                    try:
-                        final_tm = trimesh.boolean.union([tm1, tm2], engine='scad')
-                    except:
-                        final_tm = tm1
-                final_fc = trimesh_to_freecad(final_tm)
-            else:
-                final_fc = cut_wing_fc
-        except Exception as e:
-            print(f"  Final union failed: {e}")
-            final_fc = cut_wing_fc
-        finally:
-            try:
-                os.unlink(tmp1_stl)
-                os.unlink(tmp2_stl)
-            except:
-                pass
-    if vis:
-        from viz_utils import show_mesh
-        show_mesh(final_fc, doc, "FinalMesh", color=(0.8,0.8,0.8), transparency=50)
-    end_op()
-    return final_fc
-
-def create_rib_surfaces(wing_mesh, rib_lines, plane_normal):
-    surfaces = []
-    for start, end in rib_lines:
-        d = end - start
-        length = np.linalg.norm(d)
-        if length < 1e-8:
-            continue
-        d = d / length
-
-        rib_plane_normal = np.cross(d, plane_normal)
-        if np.linalg.norm(rib_plane_normal) < 1e-8:
-            continue
-        rib_plane_normal = rib_plane_normal / np.linalg.norm(rib_plane_normal)
-
-        try:
-            path = trimesh.intersections.slice_mesh_plane(
-                wing_mesh,
-                plane_normal=rib_plane_normal,
-                plane_origin=start
-            )
-        except Exception:
-            continue
-
-        if path is None or len(path.vertices) < 3:
-            continue
-
-        verts = path.vertices
-        edges = path.edges
-
-        # Local basis
-        u = verts[edges[0][1]] - verts[edges[0][0]]
-        u_norm = np.linalg.norm(u)
-        if u_norm < 1e-8:
-            u = np.cross(rib_plane_normal, [1, 0, 0])
-            if np.linalg.norm(u) < 1e-8:
-                u = np.cross(rib_plane_normal, [0, 1, 0])
-            u = u / np.linalg.norm(u)
-        else:
-            u = u / u_norm
-        v = np.cross(rib_plane_normal, u)
-        v = v / np.linalg.norm(v)
-
-        origin = verts[0]
-
-        coords_2d = []
-        for p in verts:
-            dx = np.dot(p - origin, u)
-            dy = np.dot(p - origin, v)
-            coords_2d.append((dx, dy))
-
-        lines_2d = []
-        for edge in edges:
-            p1 = coords_2d[edge[0]]
-            p2 = coords_2d[edge[1]]
-            lines_2d.append(sg.LineString([p1, p2]))
-
-        merged = sg.MultiLineString(lines_2d)
-        polygons = list(polygonize(merged))
-        if not polygons:
-            continue
-
-        # Select the largest polygon
-        poly = max(polygons, key=lambda p: p.area)
-        if poly.is_empty or poly.area < 1e-8:
-            continue
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-
-        # Triangulate the polygon directly
-        try:
-            verts_2d, faces = trimesh.creation.triangulate_polygon(poly)
-        except Exception as e:
-            print(f"  Triangulation failed for a rib: {e}")
-            continue
-
-        if len(verts_2d) < 3 or len(faces) == 0:
-            continue
-
-        # Map to 3D
-        verts_3d = []
-        for (x2d, y2d) in verts_2d:
-            pt = origin + x2d * u + y2d * v
-            verts_3d.append(pt)
-
-        face_mesh = trimesh.Trimesh(vertices=verts_3d, faces=faces)
-        if face_mesh is not None and len(face_mesh.vertices) > 0:
-            face_mesh.fix_normals()
-            surfaces.append(face_mesh)
-
-    return surfaces
-
-
-def create_rib_centre_surfaces(wing_shape, rib_center_lines, plane_normal, doc, vis=False, tol=1e-4):
-    """
-    Returns (faces, edges).
-    faces: list of Part.Face — one for each closed region (including holes)
-    edges: list of Part.Edge — all raw intersection edges
-    """
-    faces = []
-    all_edges = []
-
-    for line in rib_center_lines:
-        start = line.Vertexes[0].Point
-        end   = line.Vertexes[-1].Point
-        rib_dir = (end - start).normalize()
-        n_rib = rib_dir.cross(plane_normal).normalize()
-        plane = Part.Plane(start, n_rib)
-        try:
-            intersect = wing_shape.section(plane)
-            if not intersect or not intersect.Edges:
-                continue
-            edges = list(intersect.Edges)
-            all_edges.extend(edges)
-
-            # ---- Build all closed wires by edge stitching ----
-            used = [False] * len(edges)
-            wires = []
-            for i in range(len(edges)):
-                if used[i]:
-                    continue
-                # Start a new wire
-                loop = [edges[i]]
-                used[i] = True
-                cur_end = edges[i].Vertexes[-1].Point
-                changed = True
-                while changed:
-                    changed = False
-                    for j, e in enumerate(edges):
-                        if used[j]:
-                            continue
-                        if e.Vertexes[0].Point.isEqual(cur_end, tol):
-                            loop.append(e)
-                            used[j] = True
-                            cur_end = e.Vertexes[-1].Point
-                            changed = True
-                            break
-                        elif e.Vertexes[-1].Point.isEqual(cur_end, tol):
-                            rev = e.copy()
-                            rev.reverse()
-                            loop.append(rev)
-                            used[j] = True
-                            cur_end = e.Vertexes[0].Point
-                            changed = True
-                            break
-                # Close the wire
-                if len(loop) > 1:
-                    try:
-                        wire = Part.Wire(loop)
-                        wires.append(wire)
-                    except:
-                        continue
-
-            # For each closed wire, create a face. We will not attempt to detect nesting; just create faces.
-            # If there is nesting, some faces may be holes, but they will be separate objects.
-            # That's acceptable for visualisation and further processing.
-            for wire in wires:
-                if wire.isClosed() and not wire.isNull():
-                    try:
-                        face = Part.Face(wire)
-                        if face.isValid():
-                            faces.append(face)
-                    except:
-                        # Fallback: try to create face with tolerance
-                        try:
-                            face = Part.Face(wire, tolerance=tol)
-                            if face.isValid():
-                                faces.append(face)
-                        except:
-                            continue
-        except Exception:
-            continue
-    if vis:
-        from viz_utils import show_rib_centre_surfaces, show_rib_centre_edges
-        show_rib_centre_surfaces(faces, doc, color=(0.8, 0.4, 0.8), transparency=50)
-        print(f"Created {len(faces)} rib centre surfaces.")
-        show_rib_centre_edges(edges, doc, line_color=(0.2, 0.5, 1.0), line_width=2)
-        print(f"Created {len(edges)} rib centre edges.")
-    return faces, all_edges
 
 def create_rib_surfaces_trimesh(wing_mesh, rib_center_lines_np, plane_normal_np, doc=None, vis=False):
     """
@@ -884,7 +322,7 @@ def clip_surfaces_to_solid(rib_center_lines_np, wing_mesh, plane_normal_np,
     """
 
     clipped = []
-
+    valid_indices = []
     print(f"Clipping {len(rib_center_lines_np)} rib planes against wing...")
 
     for i, (start, end) in enumerate(rib_center_lines_np):
@@ -980,6 +418,7 @@ def clip_surfaces_to_solid(rib_center_lines_np, wing_mesh, plane_normal_np,
 
         rib_mesh = trimesh.util.concatenate(rib_meshes)
         clipped.append(rib_mesh)
+        valid_indices.append(i)
 
         print(f"Plane {i}: clipped surface created ({len(rib_mesh.vertices)} verts)")
 
@@ -1011,4 +450,203 @@ def clip_surfaces_to_solid(rib_center_lines_np, wing_mesh, plane_normal_np,
         except Exception as e:
             print(f"Visualisation error: {e}")
 
-    return clipped
+    return clipped, valid_indices
+
+def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
+                                  doc=None, vis=False):
+    """
+    Analitically build rib segments by intersecting a pre-built grid of
+    rectangles with the wing's exact cross‑section polygon.
+
+    Steps:
+    1. For each rib centre line, compute its intersection points with every
+       other line → segment boundaries.
+    2. Obtain the wing's cross‑section polygon on the rib plane using
+       wing_mesh.section() and to_planar().
+    3. Map all crossing points into the polygon's local 2D coordinates
+       (using the transformation matrix from to_planar).
+    4. For each interval between consecutive u-values, build a rectangle
+       in that same 2D space (interval horizontally, full polygon v-range).
+    5. Intersect rectangle with wing polygon, triangulate, and transform
+       back to 3D via the original 4x4 matrix.
+    """
+    # Precompute line data
+    lines_data = []
+    for (start, end) in all_lines_np:
+        d = end - start
+        norm = np.linalg.norm(d)
+        if norm < 1e-8:
+            lines_data.append(None)
+            continue
+        d /= norm
+        lines_data.append({'point': start, 'dir': d})
+
+    def intersect_lines(p1, d1, p2, d2):
+        """3D line‑line intersection, returns 3D point or None"""
+        A = np.column_stack((d1, -d2))
+        b = p2 - p1
+        try:
+            st, residuals, rank, sv = np.linalg.lstsq(A, b, rcond=None)
+        except np.linalg.LinAlgError:
+            return None
+        if rank < 2:
+            return None
+        s, t = st[0], st[1]
+        p_intersect = p1 + s * d1
+        if np.linalg.norm(p2 + t * d2 - p_intersect) > 1e-6:
+            return None
+        return p_intersect
+
+    all_segments = []
+
+    for i, (line_i, ld_i) in enumerate(zip(all_lines_np, lines_data)):
+        if ld_i is None:
+            continue
+
+        p_i = ld_i['point']      # start of line i
+        d_i = ld_i['dir']        # unit direction
+
+        # ---- 1. Collect crossing parameters (s) along the line ----
+        crossing_params = []
+        for j, ld_j in enumerate(lines_data):
+            if j == i or ld_j is None:
+                continue
+            if abs(np.dot(d_i, ld_j['dir'])) > 0.9999:
+                continue   # parallel → skip
+            pt = intersect_lines(p_i, d_i, ld_j['point'], ld_j['dir'])
+            if pt is None:
+                continue
+            s = np.dot(pt - p_i, d_i)
+            crossing_params.append(s)
+
+        # Add bounding box extremes to catch the whole wing
+        bbox = wing_mesh.bounds
+        bbox_center = (bbox[0] + bbox[1]) / 2
+        proj = [np.dot(np.array(c), d_i) for c in [bbox[0], bbox[1], bbox_center]]
+        s_min = min(proj) - 10.0
+        s_max = max(proj) + 10.0
+        crossing_params.append(s_min)
+        crossing_params.append(s_max)
+
+        crossing_params = sorted(set(crossing_params))
+
+        # ---- 2. Wing cross‑section polygon + local 2D transform ----
+        N_i = np.cross(d_i, plane_normal_np)
+        nL = np.linalg.norm(N_i)
+        if nL < 1e-8:
+            continue
+        N_i /= nL
+        try:
+            section = wing_mesh.section(plane_origin=p_i, plane_normal=N_i)
+        except Exception:
+            continue
+        if section is None:
+            continue
+        try:
+            planar, to_3d = section.to_planar()
+        except Exception:
+            continue
+        polygons = planar.polygons_full
+        if not polygons:
+            continue
+        wing_poly = polygons[0]
+        if wing_poly.is_empty or wing_poly.area < 1e-8:
+            continue
+
+        # Extract 2D‑to‑3D transformation details
+        # to_3d is a 4x4 matrix; we need its inverse to map 3D → local 2D
+        to_3d_mat = np.array(to_3d)   # shape (4,4)
+        # The last column is the plane origin (homogeneous)
+        origin_3d = to_3d_mat[:3, 3]
+        # The first two columns are the orthonormal basis vectors (u, v)
+        u_poly = to_3d_mat[:3, 0]
+        v_poly = to_3d_mat[:3, 1]
+        # Build inverse projection: point 3D → [u, v] = [ dot(P-O, u_poly), dot(P-O, v_poly) ]
+        def project_to_local(pt3d):
+            delta = pt3d - origin_3d
+            return np.array([np.dot(delta, u_poly), np.dot(delta, v_poly)])
+
+        # ---- 3. Map the wing polygon to local 2D (already done, it's wing_poly) ----
+        # wing_poly is in local 2D coordinates; we can query its v‑range
+        minx, miny, maxx, maxy = wing_poly.bounds
+        v_min = miny
+        v_max = maxy
+
+        # ---- 4. Project crossing points into local 2D ----
+        # crossing_params are s values along d_i. We must map 3D points
+        # p_i + s * d_i to local 2D to get their u‑coordinate.
+        crossing_u = []
+        for s in crossing_params:
+            pt3d = p_i + s * d_i
+            uv = project_to_local(pt3d)
+            crossing_u.append(uv[0])   # u‑coordinate in polygon's space
+
+        crossing_u = sorted(set(crossing_u))
+
+        # ---- 5. For each interval, build a rectangle in polygon's 2D space ----
+        for k in range(len(crossing_u)-1):
+            u0 = crossing_u[k]
+            u1 = crossing_u[k+1]
+            if u1 - u0 < 1e-8:
+                continue
+
+            # rectangle: [u0,u1] x [v_min, v_max]
+            rect_pts = [
+                (u0, v_min),
+                (u1, v_min),
+                (u1, v_max),
+                (u0, v_max)
+            ]
+            rect = ShapelyPolygon(rect_pts)
+
+            # Intersect with wing polygon
+            try:
+                intersection = rect.intersection(wing_poly)
+            except Exception:
+                continue
+            if intersection.is_empty:
+                continue
+
+            if intersection.geom_type == 'Polygon':
+                cells = [intersection]
+            elif intersection.geom_type == 'MultiPolygon':
+                cells = list(intersection.geoms)
+            elif intersection.geom_type == 'GeometryCollection':
+                cells = [g for g in intersection.geoms if g.geom_type == 'Polygon']
+            else:
+                continue
+
+            for cell in cells:
+                if cell.is_empty or cell.area < 1e-8:
+                    continue
+                try:
+                    verts2d, faces = trimesh.creation.triangulate_polygon(cell)
+                except Exception:
+                    continue
+                if len(verts2d) == 0 or len(faces) == 0:
+                    continue
+
+                # Map back to 3D using the same to_3d matrix
+                verts_h = np.column_stack([verts2d, np.zeros(len(verts2d)), np.ones(len(verts2d))])
+                verts3d = (to_3d_mat @ verts_h.T).T[:, :3]
+
+                seg_mesh = trimesh.Trimesh(vertices=verts3d, faces=faces, process=False)
+                seg_mesh.fix_normals()
+                all_segments.append(seg_mesh)
+
+    print(f"Created {len(all_segments)} rib segments (analytical grid).")
+
+    # Visualisation
+    if vis and doc and all_segments:
+        try:
+            combined = trimesh.util.concatenate(all_segments)
+            fc_mesh = trimesh_to_freecad(combined)
+            if fc_mesh:
+                show_mesh(fc_mesh, doc, "RibSegmentsAnalytical",
+                          color=(0.2, 0.8, 0.4), transparency=30)
+                doc.recompute()
+                print("Rib segments visualised.")
+        except Exception as e:
+            print(f"Visualisation error: {e}")
+
+    return all_segments
