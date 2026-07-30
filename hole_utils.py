@@ -16,17 +16,8 @@ from scipy.spatial import ConvexHull
 
 def create_holes(wing_mesh, rib_segments, primary_dir_np,
                  z_step=0.2, point_condition=None, hole_margin=0.0,
+                 z_vals=None, slices=None,
                  doc=None, vis=False):
-    """
-    Build hole ribbons inside each rib segment, with a safety margin from
-    the wing surface and from the top/bottom of the segment.
-
-    Parameters
-    ----------
-    hole_margin : float
-        Distance (in model units) to keep away from the wing surface (on both
-        sides of the chord) and from the top/bottom of the segment's Z extent.
-    """
     if point_condition is None:
         point_condition = lambda x: 0.0
 
@@ -39,62 +30,9 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
     u_ax = u_ax / np.linalg.norm(u_ax)
     v_ax = np.cross(prim, u_ax)
 
-    def wing_poly_at_plane(plane_origin):
-        # ... identical to previous version ...
-        try:
-            result = trimesh.intersections.mesh_plane(
-                wing_mesh, plane_normal=prim, plane_origin=plane_origin
-            )
-        except Exception:
-            return None
-        if isinstance(result, tuple):
-            lines = result[0]
-        else:
-            lines = result
-        if lines is None or len(lines) == 0:
-            return None
-        origin = np.asarray(plane_origin)
-        segments_2d = []
-        for seg in lines:
-            p1 = seg[0] - origin
-            p2 = seg[1] - origin
-            u1, v1 = np.dot(p1, u_ax), np.dot(p1, v_ax)
-            u2, v2 = np.dot(p2, u_ax), np.dot(p2, v_ax)
-            if np.linalg.norm([u2 - u1, v2 - v1]) > 1e-9:
-                segments_2d.append(LineString([(u1, v1), (u2, v2)]))
-        if not segments_2d:
-            return None
-        merged = linemerge(segments_2d)
-        if merged.is_empty:
-            return None
-        polys = list(polygonize(merged))
-        if not polys:
-            all_pts = []
-            for line in segments_2d:
-                all_pts.extend(line.coords)
-            pts = np.array(all_pts)
-            if len(pts) < 3:
-                return None
-            try:
-                hull = ConvexHull(pts)
-                poly = ShapelyPolygon(pts[hull.vertices])
-            except Exception:
-                return None
-        else:
-            poly = max(polys, key=lambda p: p.area)
-        if poly.is_empty or poly.area < 1e-8:
-            return None
-        to_3d = np.eye(4)
-        to_3d[:3, 0] = u_ax
-        to_3d[:3, 1] = v_ax
-        to_3d[:3, 3] = origin
-        return poly, to_3d
-
     all_vertices = []
     all_faces = []
     vert_offset = 0
-    num_holes = 0
-    total_segments = len(rib_segments)
 
     for seg in rib_segments:
         p0 = seg['p0']
@@ -107,12 +45,11 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
         d_min = min(d0, d1)
         d_max = max(d0, d1)
 
-        # Apply Z margin
         d_start = d_min + hole_margin
         d_end   = d_max - hole_margin
         if d_start >= d_end:
             continue
-        segment_z_span = d_end - d_start   # used for normalised position
+        segment_z_span = d_end - d_start
 
         line_dir_3d = np.cross(slab_normal, prim)
         norm_l = np.linalg.norm(line_dir_3d)
@@ -123,28 +60,25 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
         bridge_dir_2d /= np.linalg.norm(bridge_dir_2d)
 
         ribbon_pts = []
-        d = d_start
-        while d <= d_end + 1e-9:
-            plane_origin = d * prim
-            res = wing_poly_at_plane(plane_origin)
-            if res is None:
-                d += z_step
-                continue
-            wing_poly, to_3d_mat = res
+
+        start_idx = np.searchsorted(z_vals, d_start)
+        end_idx = np.searchsorted(z_vals, d_end, side='right')
+
+        for idx in range(start_idx, end_idx):
+            d = z_vals[idx]
+            wing_poly, to_3d_mat = slices[idx]
 
             denom = np.dot(prim, dir_rib)
             if abs(denom) < 1e-8:
-                d += z_step
                 continue
-            t_plane = np.dot(prim, plane_origin - p0) / denom
+            t_plane = np.dot(prim, d * prim - p0) / denom
             P_3d = p0 + t_plane * dir_rib
 
-            P_uv = np.array([np.dot(P_3d - plane_origin, u_ax),
-                             np.dot(P_3d - plane_origin, v_ax)])
+            P_uv = np.array([np.dot(P_3d - d * prim, u_ax),
+                             np.dot(P_3d - d * prim, v_ax)])
 
             wing_uv = ShapelyPolygon(np.array(wing_poly.exterior.coords))
             if not wing_uv.contains(Point(P_uv)):
-                d += z_step
                 continue
 
             extent = 1e5
@@ -152,10 +86,8 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
             try:
                 chord = wing_uv.intersection(line)
             except Exception:
-                d += z_step
                 continue
             if chord.is_empty:
-                d += z_step
                 continue
 
             if chord.geom_type == 'MultiLineString':
@@ -168,25 +100,22 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
                         best_seg = sub
                 chord = best_seg
             if chord is None or chord.is_empty:
-                d += z_step
                 continue
 
             coords = np.array(chord.coords)
             t_vals = np.dot(coords, bridge_dir_2d)
             t_min, t_max = t_vals.min(), t_vals.max()
 
-            # Shrink chord by hole_margin on each side
             t_min_safe = t_min + hole_margin
             t_max_safe = t_max - hole_margin
             if t_min_safe >= t_max_safe:
-                d += z_step
                 continue
 
             t_center = np.dot(P_uv, bridge_dir_2d)
             chord_half_effective = (t_max_safe - t_min_safe) / 2.0
 
             if segment_z_span > 1e-8:
-                x = (d - d_start) / segment_z_span   # 0..1
+                x = (d - d_start) / segment_z_span
             else:
                 x = 0.0
             factor = point_condition(x)
@@ -206,10 +135,8 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
             pt_left  = uv_to_3d(seg_start_uv)
             pt_right = uv_to_3d(seg_end_uv)
             ribbon_pts.append((d, pt_left, pt_right))
-            d += z_step
 
         if len(ribbon_pts) >= 2:
-            num_holes += 1
             ribbon_pts.sort(key=lambda x: x[0])
             for k in range(len(ribbon_pts) - 1):
                 _, L1, R1 = ribbon_pts[k]
@@ -234,7 +161,6 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
     hole_mesh.fix_normals()
 
     print(f"Hole mesh: {len(hole_mesh.vertices)} verts, {len(hole_mesh.faces)} faces")
-    print(f"Holes created: {num_holes} out of {total_segments} rib segments")
 
     if vis and doc:
         try:

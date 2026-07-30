@@ -16,84 +16,16 @@ from scipy.spatial import ConvexHull
 
 def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
                               z_step=0.2, bridge_height=0.5,
+                              z_vals=None, slices=None,
                               doc=None, vis=False):
-    """
-    Build bridge ribbons for each rib segment.
-
-    Parameters
-    ----------
-    wing_mesh : trimesh.Trimesh
-    rib_segments : list[dict]
-        Each dict must contain:
-            'p0' : numpy (3,) – start of segment (3D)
-            'p1' : numpy (3,) – end of segment (3D)
-            'dir' : numpy (3,) – unit direction along the rib
-            'slab_normal' : numpy (3,) – normal of the slab plane
-    """
     prim = primary_dir_np / np.linalg.norm(primary_dir_np)
 
-    # ---- Fixed basis for slice plane ----
     if abs(prim[0]) > 0.9:
         u_ax = np.cross(prim, [0, 1, 0])
     else:
         u_ax = np.cross(prim, [1, 0, 0])
     u_ax = u_ax / np.linalg.norm(u_ax)
     v_ax = np.cross(prim, u_ax)
-
-    def wing_poly_at_plane(plane_origin):
-        """Return (2D polygon, 4x4 transform) or None."""
-        try:
-            result = trimesh.intersections.mesh_plane(
-                wing_mesh, plane_normal=prim, plane_origin=plane_origin
-            )
-        except Exception:
-            return None
-        if isinstance(result, tuple):
-            lines = result[0]
-        else:
-            lines = result
-        if lines is None or len(lines) == 0:
-            return None
-
-        origin = np.asarray(plane_origin)
-        segments_2d = []
-        for seg in lines:
-            p1 = seg[0] - origin
-            p2 = seg[1] - origin
-            u1, v1 = np.dot(p1, u_ax), np.dot(p1, v_ax)
-            u2, v2 = np.dot(p2, u_ax), np.dot(p2, v_ax)
-            if np.linalg.norm([u2 - u1, v2 - v1]) > 1e-9:
-                segments_2d.append(LineString([(u1, v1), (u2, v2)]))
-
-        if not segments_2d:
-            return None
-        merged = linemerge(segments_2d)
-        if merged.is_empty:
-            return None
-        polys = list(polygonize(merged))
-        if not polys:
-            all_pts = []
-            for line in segments_2d:
-                all_pts.extend(line.coords)
-            pts = np.array(all_pts)
-            if len(pts) < 3:
-                return None
-            try:
-                hull = ConvexHull(pts)
-                poly = ShapelyPolygon(pts[hull.vertices])
-            except Exception:
-                return None
-        else:
-            poly = max(polys, key=lambda p: p.area)
-
-        if poly.is_empty or poly.area < 1e-8:
-            return None
-
-        to_3d = np.eye(4)
-        to_3d[:3, 0] = u_ax
-        to_3d[:3, 1] = v_ax
-        to_3d[:3, 3] = origin
-        return poly, to_3d
 
     all_vertices = []
     all_faces = []
@@ -105,13 +37,11 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
         dir_rib = seg['dir']
         slab_normal = seg['slab_normal']
 
-        # ----- Z range of this segment -----
         d0 = np.dot(p0, prim)
         d1 = np.dot(p1, prim)
         d_min = min(d0, d1)
         d_max = max(d0, d1)
 
-        # ----- Bridge direction (intersection of slab and slice) -----
         line_dir_3d = np.cross(slab_normal, prim)
         norm_l = np.linalg.norm(line_dir_3d)
         if norm_l < 1e-8:
@@ -121,43 +51,35 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
         bridge_dir_2d /= np.linalg.norm(bridge_dir_2d)
 
         ribbon_pts = []
-        d = d_min
-        while d <= d_max + 1e-9:
-            plane_origin = d * prim
-            res = wing_poly_at_plane(plane_origin)
-            if res is None:
-                d += z_step
-                continue
-            wing_poly, to_3d_mat = res
 
-            # Intersection of rib line with this slice plane
+        # Find start and end indices in the slice arrays
+        start_idx = np.searchsorted(z_vals, d_min)
+        end_idx = np.searchsorted(z_vals, d_max, side='right')
+
+        for idx in range(start_idx, end_idx):
+            d = z_vals[idx]
+            wing_poly, to_3d_mat = slices[idx]
+
             denom = np.dot(prim, dir_rib)
             if abs(denom) < 1e-8:
-                d += z_step
                 continue
-            t_plane = np.dot(prim, plane_origin - p0) / denom   # using p0 as reference
+            t_plane = np.dot(prim, d * prim - p0) / denom
             P_3d = p0 + t_plane * dir_rib
 
-            # 2D coordinates
-            P_uv = np.array([np.dot(P_3d - plane_origin, u_ax),
-                             np.dot(P_3d - plane_origin, v_ax)])
+            P_uv = np.array([np.dot(P_3d - d * prim, u_ax),
+                             np.dot(P_3d - d * prim, v_ax)])
 
-            # Optional safety: ensure P_uv lies inside wing cross‑section
             wing_uv = ShapelyPolygon(np.array(wing_poly.exterior.coords))
             if not wing_uv.contains(Point(P_uv)):
-                d += z_step
                 continue
 
-            # Find chord along bridge_dir_2d through P_uv
             extent = 1e5
             line = LineString([P_uv - extent * bridge_dir_2d, P_uv + extent * bridge_dir_2d])
             try:
                 chord = wing_uv.intersection(line)
             except Exception:
-                d += z_step
                 continue
             if chord.is_empty:
-                d += z_step
                 continue
 
             if chord.geom_type == 'MultiLineString':
@@ -170,7 +92,6 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
                         best_seg = sub
                 chord = best_seg
             if chord is None or chord.is_empty:
-                d += z_step
                 continue
 
             coords = np.array(chord.coords)
@@ -192,11 +113,8 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
 
             pt_left  = uv_to_3d(seg_start_uv)
             pt_right = uv_to_3d(seg_end_uv)
-
             ribbon_pts.append((d, pt_left, pt_right))
-            d += z_step
 
-        # Build quad mesh for this segment
         if len(ribbon_pts) >= 2:
             ribbon_pts.sort(key=lambda x: x[0])
             for k in range(len(ribbon_pts) - 1):
