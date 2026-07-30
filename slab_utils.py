@@ -5,66 +5,14 @@ import Part
 import Mesh
 import MeshPart
 import math
-import sys
-import time
 import os
 import tempfile
 import numpy as np
 import trimesh
-import shapely.geometry as sg
-from shapely.ops import polygonize
-from functools import wraps
-from shapely.geometry import Polygon as ShapelyPolygon, LineString
+from shapely.geometry import Polygon as ShapelyPolygon
 import trimesh.path.polygons
-from shapely.ops import split
-from shapely.geometry import Polygon as ShapelyPolygon, LineString
+from shapely.geometry import Polygon as ShapelyPolygon
 from viz_utils import show_mesh
-# ------------------------------------------------------------
-# Profiling (complete)
-# ------------------------------------------------------------
-class FreeCADProfiler:
-    def __init__(self):
-        self.operation_stack = []
-        self.enabled = True
-
-    def log_op(self, name: str, level: int = 0):
-        if not self.enabled:
-            return
-        if self.operation_stack:
-            prev_name, prev_start = self.operation_stack[-1]
-            duration = time.time() - prev_start
-            prefix = "  " * (level - 1)
-            sys.stdout.write(f"{prefix}--> {prev_name} completed in {duration:.2f}s\n")
-            sys.stdout.flush()
-        self.operation_stack.append((name, time.time()))
-        prefix = "  " * level
-        sys.stdout.write(f"{prefix}Starting: {name}\n")
-        sys.stdout.flush()
-
-    def end_op(self, obj_count: int = 0):
-        if not self.enabled or not self.operation_stack:
-            return
-        name, start_time = self.operation_stack.pop()
-        duration = time.time() - start_time
-        prefix = "  " * len(self.operation_stack)
-        if obj_count > 0:
-            sys.stdout.write(f"{prefix}✅ {name} completed in {duration:.2f}s ({obj_count} objects)\n")
-        else:
-            sys.stdout.write(f"{prefix}✅ {name} completed in {duration:.2f}s\n")
-        sys.stdout.flush()
-
-    def log(self, msg: str, level: int = 0):
-        if not self.enabled:
-            return
-        prefix = "  " * level
-        sys.stdout.write(f"{prefix}📝 {msg}\n")
-        sys.stdout.flush()
-
-profiler = FreeCADProfiler()
-log = profiler.log
-start_op = profiler.log_op
-end_op = profiler.end_op
-log_op = profiler.log
 
 # ------------------------------------------------------------
 # Mesh repair (from your pure Python script)

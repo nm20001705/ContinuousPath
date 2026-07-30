@@ -4,10 +4,8 @@ import FreeCAD
 import Part
 import Mesh
 import MeshPart
-import math
 import numpy as np
 import trimesh
-import shapely.geometry as sg
 from shapely.geometry import Polygon as ShapelyPolygon, LineString
 import trimesh.path.polygons
 from shapely.geometry import Polygon as ShapelyPolygon, LineString, Point

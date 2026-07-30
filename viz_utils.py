@@ -2,7 +2,6 @@
 import FreeCAD
 import FreeCADGui
 import Part
-import math
 
 def show_mesh(mesh, doc, name, color=None, transparency=None, display_mode="Shaded"):
     """Display a Mesh object."""
