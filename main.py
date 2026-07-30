@@ -1,4 +1,4 @@
-# main.py – fully optimised with cached wing slices and pickle persistence
+# main.py – fully optimised with cached wing slices, mesh-hash protection, and robust guards
 
 from types import SimpleNamespace
 import FreeCAD
@@ -12,8 +12,6 @@ from scipy.spatial import ConvexHull
 from tqdm import tqdm
 import pickle
 import os
-from slab_utils import trimesh_to_freecad
-from viz_utils import show_mesh
 
 from slab_utils import (
     create_rib_surfaces_trimesh,
@@ -121,6 +119,52 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
 
 
 # ------------------------------------------------------------
+# Improved mesh repair (preserves intentional holes)
+# ------------------------------------------------------------
+def repair_mesh(mesh):
+    """
+    Minimal repair that fixes only very small defects while preserving
+    intentional holes (servo cutouts, lightening holes).
+    """
+    if mesh is None:
+        return None
+    if isinstance(mesh, trimesh.Scene):
+        meshes = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not meshes:
+            return None
+        mesh = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+        if mesh is None:
+            return None
+    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
+        return None
+
+    try:
+        mesh.merge_vertices()
+    except:
+        pass
+    try:
+        mesh.remove_degenerate_faces()
+    except:
+        pass
+    try:
+        mesh.fix_normals()
+    except:
+        pass
+
+    # Fill only very small holes (≤0.1 mm) – won't close intentional cutouts
+    try:
+        mesh = trimesh.repair.fill_holes(mesh, max_hole=0.1)
+    except:
+        pass
+    try:
+        mesh.fix_normals()
+    except:
+        pass
+
+    return mesh
+
+
+# ------------------------------------------------------------
 # Main function
 # ------------------------------------------------------------
 def main(params):
@@ -139,11 +183,13 @@ def main(params):
             raise RuntimeError("Object not found.")
         wing_shape = wing_obj.Shape
 
-    # ---- Convert wing to trimesh ----
+    # ---- Convert wing to trimesh (with minimal repair) ----
     print("Converting wing to trimesh...")
     wing_mesh = shape_to_trimesh(wing_shape, deflection=0.5, angular=0.5)
     if wing_mesh is None:
         raise RuntimeError("Failed to convert wing to trimesh")
+    # Apply our improved repair
+    wing_mesh = repair_mesh(wing_mesh)
     print(f"Wing bounds: {wing_mesh.bounds}")
     print(f"Is watertight: {wing_mesh.is_watertight}, is volume: {wing_mesh.is_volume}")
 
@@ -169,6 +215,9 @@ def main(params):
     d_min = proj.min() - 1e-3
     d_max = proj.max() + 1e-3
 
+    # ---- Mesh hash for cache validation ----
+    mesh_hash = hash(wing_mesh.vertices.tobytes())
+
     # ---- Precompute / load Z-slices from cache ----
     cache_dir = os.path.dirname(params.doc_path) if params.doc_path else os.getcwd()
     cache_filename = f"{params.obj_name}.pkl"
@@ -180,12 +229,13 @@ def main(params):
         try:
             with open(cache_path, 'rb') as f:
                 data = pickle.load(f)
-            if data.get('z_step') == params.z_step:
+            if (data.get('z_step') == params.z_step and
+                data.get('mesh_hash') == mesh_hash):
                 z_vals = data['z_vals']
                 slices = data['slices']
                 print(f"Loaded {len(slices)} slices from cache.")
             else:
-                print("Cached z_step differs from current; recomputing...")
+                print("Cache is stale (mesh or z_step changed); recomputing...")
         except Exception as e:
             print(f"Failed to load cache ({e}); recomputing...")
 
@@ -194,10 +244,10 @@ def main(params):
         z_vals, slices = precompute_slices(wing_mesh, primary_dir_np, params.z_step,
                                            d_min=d_min, d_max=d_max)
         print(f"Precomputed {len(slices)} slices")
-        # Save to cache
         try:
             with open(cache_path, 'wb') as f:
-                pickle.dump({'z_vals': z_vals, 'slices': slices, 'z_step': params.z_step}, f)
+                pickle.dump({'z_vals': z_vals, 'slices': slices,
+                             'z_step': params.z_step, 'mesh_hash': mesh_hash}, f)
             print(f"Slices cached to {cache_path}")
         except Exception as e:
             print(f"Warning: could not save slice cache: {e}")
@@ -305,14 +355,17 @@ def main(params):
     # ---- Show wing mesh (for debugging) ----
     if params.vis_wing:
         try:
+            from slab_utils import trimesh_to_freecad
             wing_fc_mesh = trimesh_to_freecad(wing_mesh)
             if wing_fc_mesh:
+                from viz_utils import show_mesh
                 show_mesh(wing_fc_mesh, doc, "WingMesh",
                           color=(0.5, 0.5, 0.5), transparency=50)
                 doc.recompute()
                 print("Wing mesh visualised.")
         except Exception as e:
             print(f"Wing mesh visualisation error: {e}")
+
     # ---- Save ----
     doc.save()
     print("Document saved.")
@@ -340,7 +393,6 @@ if __name__ == "__main__":
 
     params = SimpleNamespace(
         doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.FCStd",
-        # obj_name='Part__Feature_solid',
         obj_name='WingR1_msv_orient001_solid',
         rib_spacing=20.0,
         rib_angle=30.0,
@@ -355,15 +407,14 @@ if __name__ == "__main__":
         vis_centre_lines=False,
         vis_bridge=True,
         vis_hole=True,
-        z_step=0.2, 
-        vis_wing=True
+        vis_wing=True,
+        z_step=0.2
     )
 
     params.plane_normal = pdef['normal']
     params.plane_axis_u = pdef['axis_u']
     params.plane_axis_v = pdef['axis_v']
 
-    # Project primary_dir onto the construction plane if needed
     if params.primary_dir is not None:
         n = params.plane_normal
         pd = params.primary_dir

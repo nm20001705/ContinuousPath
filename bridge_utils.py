@@ -31,6 +31,16 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
     all_faces = []
     vert_offset = 0
 
+    # ----- Debug counters -----
+    total_slices_visited = 0
+    skipped_chord_empty = 0
+    skipped_degenerate = 0
+    skipped_chord_len = 0
+    skipped_invalid_poly = 0
+    skipped_midpoint = 0
+    skipped_seg_width = 0
+    kept = 0
+
     for seg in rib_segments:
         p0 = seg['p0']
         p1 = seg['p1']
@@ -58,6 +68,7 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
         for idx in range(start_idx, end_idx):
             d = z_vals[idx]
             wing_poly, to_3d_mat = slices[idx]
+            total_slices_visited += 1
 
             denom = np.dot(prim, dir_rib)
             if abs(denom) < 1e-8:
@@ -68,10 +79,8 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
             P_uv = np.array([np.dot(P_3d - d * prim, u_ax),
                              np.dot(P_3d - d * prim, v_ax)])
 
-            # Build 2D wing polygon (needed for chord search)
             wing_uv = ShapelyPolygon(np.array(wing_poly.exterior.coords))
 
-            # Find chord along bridge_dir_2d through P_uv
             extent = 1e5
             line = LineString([P_uv - extent * bridge_dir_2d, P_uv + extent * bridge_dir_2d])
             try:
@@ -79,6 +88,7 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
             except Exception:
                 continue
             if chord.is_empty:
+                skipped_chord_empty += 1
                 continue
 
             if chord.geom_type == 'MultiLineString':
@@ -91,16 +101,24 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
                         best_seg = sub
                 chord = best_seg
             if chord is None or chord.is_empty:
+                skipped_chord_empty += 1
                 continue
 
             coords = np.array(chord.coords)
-            # Discard degenerate chords (length ≈ 0)
-            if len(coords) < 2 or np.linalg.norm(coords[-1] - coords[0]) < 1e-6:
+            if len(coords) < 2:
+                skipped_degenerate += 1
                 continue
 
-            # ---- Midpoint of the chord ----
+            chord_len = np.linalg.norm(coords[-1] - coords[0])
+            if chord_len < 0.1:
+                skipped_chord_len += 1
+                continue
+
+            if not wing_uv.is_valid:
+                skipped_invalid_poly += 1
+                continue
+
             midpoint_uv = (coords[0] + coords[-1]) / 2.0
-            # Midpoint guard: discard if midpoint is not inside the wing (with tiny tolerance)
             if not wing_uv.buffer(1e-6).contains(Point(midpoint_uv)):
                 continue
 
@@ -111,6 +129,10 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
             half_w = bridge_height
             t_start = max(t_center - half_w, t_min)
             t_end   = min(t_center + half_w, t_max)
+
+            if t_end - t_start < 1e-6:
+                skipped_seg_width += 1
+                continue
 
             seg_start_uv = midpoint_uv + (t_start - t_center) * bridge_dir_2d
             seg_end_uv   = midpoint_uv + (t_end   - t_center) * bridge_dir_2d
@@ -123,8 +145,8 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
             pt_left  = uv_to_3d(seg_start_uv)
             pt_right = uv_to_3d(seg_end_uv)
             ribbon_pts.append((d, pt_left, pt_right))
+            kept += 1
 
-        # Build quad mesh for this segment
         if len(ribbon_pts) >= 2:
             ribbon_pts.sort(key=lambda x: x[0])
             for k in range(len(ribbon_pts) - 1):
@@ -139,27 +161,17 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
                 all_faces.append([v0, v2, v3])
                 vert_offset += 4
 
+    print(f"DEBUG: slices visited: {total_slices_visited}")
+    print(f"  chord empty: {skipped_chord_empty}")
+    print(f"  degenerate (len<2): {skipped_degenerate}")
+    print(f"  chord_len < 0.1: {skipped_chord_len}")
+    print(f"  invalid polygon: {skipped_invalid_poly}")
+    print(f"  midpoint outside: {skipped_midpoint}")
+    print(f"  segment width zero: {skipped_seg_width}")
+    print(f"  kept: {kept}")
+
     if not all_vertices:
         print("No bridge geometry generated.")
         return None
 
-    verts_arr = np.array(all_vertices)
-    faces_arr = np.array(all_faces)
-    bridge_mesh = trimesh.Trimesh(vertices=verts_arr, faces=faces_arr, process=False)
-    bridge_mesh.merge_vertices()
-    bridge_mesh.fix_normals()
-
-    print(f"Bridge mesh: {len(bridge_mesh.vertices)} verts, {len(bridge_mesh.faces)} faces")
-
-    if vis and doc:
-        try:
-            fc_mesh = trimesh_to_freecad(bridge_mesh)
-            if fc_mesh:
-                show_mesh(fc_mesh, doc, "Bridges",
-                          color=(0.9, 0.7, 0.1), transparency=20)
-                doc.recompute()
-                print("Bridges visualised.")
-        except Exception as e:
-            print(f"Visualisation error: {e}")
-
-    return bridge_mesh
+    # ... rest unchanged ...

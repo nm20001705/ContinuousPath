@@ -101,19 +101,28 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
                 continue
 
             coords = np.array(chord.coords)
-            if len(coords) < 2 or np.linalg.norm(coords[-1] - coords[0]) < 1e-6:
+            if len(coords) < 2:
                 continue
 
-            # ---- Midpoint of the chord ----
+            # ---- Guard 1: minimum chord length ----
+            chord_len = np.linalg.norm(coords[-1] - coords[0])
+            if chord_len < 0.1:
+                continue
+
+            # ---- Guard 2: wing polygon must be valid ----
+            if not wing_uv.is_valid:
+                continue
+
             midpoint_uv = (coords[0] + coords[-1]) / 2.0
-            # Midpoint guard
+
+            # ---- Guard 3: midpoint inside wing ----
             if not wing_uv.buffer(1e-6).contains(Point(midpoint_uv)):
+                skipped_midpoint += 1
                 continue
 
             t_vals = np.dot(coords, bridge_dir_2d)
             t_min, t_max = t_vals.min(), t_vals.max()
 
-            # Apply margin to chord
             t_min_safe = t_min + hole_margin
             t_max_safe = t_max - hole_margin
             if t_min_safe >= t_max_safe:
@@ -131,6 +140,10 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
 
             t_start = max(t_center - half_w, t_min_safe)
             t_end   = min(t_center + half_w, t_max_safe)
+
+            # ---- Guard 4: segment width non-zero ----
+            if t_end - t_start < 1e-6:
+                continue
 
             seg_start_uv = midpoint_uv + (t_start - t_center) * bridge_dir_2d
             seg_end_uv   = midpoint_uv + (t_end   - t_center) * bridge_dir_2d
