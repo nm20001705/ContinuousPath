@@ -10,31 +10,23 @@ import trimesh
 import shapely.geometry as sg
 from shapely.geometry import Polygon as ShapelyPolygon, LineString
 import trimesh.path.polygons
-from shapely.geometry import Polygon as ShapelyPolygon, LineString
+from shapely.geometry import Polygon as ShapelyPolygon, LineString, Point
 from viz_utils import show_mesh
 from slab_utils import trimesh_to_freecad
+from shapely.ops import linemerge, polygonize
+from scipy.spatial import ConvexHull
 
-def create_bridges_analytical(wing_mesh, all_lines_np, plane_normal_np,
+def create_bridges_analytical(wing_mesh, all_lines_np, primary_dir_np,
                               z_step=0.2, bridge_height=0.5,
                               doc=None, vis=False):
     """
-    Create bridge surfaces aligned with the rib direction inside each rib segment.
-
-    For each cell (between two rib crossings), a narrow rectangular strip is
-    placed centred on the cell's midline, oriented along the rib direction,
-    and intersected with the wing cross‑section polygon.
-    The result is an elongated ribbon that follows the rib.
-
-    Parameters
-    ----------
-    wing_mesh : trimesh.Trimesh
-    all_lines_np : list of (start, end) numpy arrays
-    plane_normal_np : (3,) np.array
-    z_step : float          (unused in this version, kept for compatibility)
-    bridge_height : float   half‑width of the bridge (perpendicular to rib direction)
-    doc, vis : as before.
+    Build bridge ribbons inside each slab by slicing the wing perpendicular to
+    primary_dir_np, finding the rib chord at every slice, and connecting narrow
+    central segments into a mesh.
     """
-    # ---- Precompute line data ----
+    prim = primary_dir_np / np.linalg.norm(primary_dir_np)
+
+    # ---- Precompute rib line data ----
     lines_data = []
     for (start, end) in all_lines_np:
         d = end - start
@@ -45,212 +37,241 @@ def create_bridges_analytical(wing_mesh, all_lines_np, plane_normal_np,
         d /= norm
         lines_data.append({'point': start, 'dir': d})
 
-    def intersect_lines(p1, d1, p2, d2):
-        A = np.column_stack((d1, -d2))
-        b = p2 - p1
+    print(f"Total rib lines: {len(all_lines_np)}, valid: {sum(ld is not None for ld in lines_data)}")
+
+    # ---- Slice range from wing bounding box ----
+    bbox = wing_mesh.bounds
+    min_pt, max_pt = bbox[0], bbox[1]
+    corners = np.array([
+        [min_pt[0], min_pt[1], min_pt[2]],
+        [min_pt[0], min_pt[1], max_pt[2]],
+        [min_pt[0], max_pt[1], min_pt[2]],
+        [min_pt[0], max_pt[1], max_pt[2]],
+        [max_pt[0], min_pt[1], min_pt[2]],
+        [max_pt[0], min_pt[1], max_pt[2]],
+        [max_pt[0], max_pt[1], min_pt[2]],
+        [max_pt[0], max_pt[1], max_pt[2]],
+    ])
+    proj = np.dot(corners, prim)
+    d_min = proj.min() - 1e-3
+    d_max = proj.max() + 1e-3
+    print(f"Slice range: d_min={d_min:.3f}, d_max={d_max:.3f}, z_step={z_step}")
+
+    # ---- Fixed basis vectors for all slice planes ----
+    if abs(prim[0]) > 0.9:
+        u_ax = np.cross(prim, [0, 1, 0])
+    else:
+        u_ax = np.cross(prim, [1, 0, 0])
+    u_ax = u_ax / np.linalg.norm(u_ax)
+    v_ax = np.cross(prim, u_ax)
+
+    def wing_poly_at_plane(plane_origin):
+        """
+        Returns (2D polygon, 4x4 transform) of the wing cross‑section at the given plane.
+        Uses trimesh.intersections.mesh_plane + Shapely polygonization.
+        """
+        # ---------- FIX: safe unpacking for all trimesh versions ----------
         try:
-            st, residuals, rank, sv = np.linalg.lstsq(A, b, rcond=None)
-        except np.linalg.LinAlgError:
+            result = trimesh.intersections.mesh_plane(
+                wing_mesh, plane_normal=prim, plane_origin=plane_origin
+            )
+        except Exception as e:
+            print(f"  [mesh_plane exception] origin={plane_origin} error={e}")
             return None
-        if rank < 2:
-            return None
-        s, t = st[0], st[1]
-        p = p1 + s * d1
-        if np.linalg.norm(p2 + t * d2 - p) > 1e-6:
-            return None
-        return p
 
-    all_bridge_meshes = []
+        # result can be (lines,) or (lines, face_index) or (lines, face_index, valid)
+        if isinstance(result, tuple):
+            lines = result[0]
+        else:
+            lines = result
 
-    for i, (line_i, ld_i) in enumerate(zip(all_lines_np, lines_data)):
+        if lines is None or len(lines) == 0:
+            return None
+
+        origin = np.asarray(plane_origin)
+        segments_2d = []
+        for seg in lines:
+            p1 = seg[0] - origin
+            p2 = seg[1] - origin
+            u1, v1 = np.dot(p1, u_ax), np.dot(p1, v_ax)
+            u2, v2 = np.dot(p2, u_ax), np.dot(p2, v_ax)
+            if np.linalg.norm([u2 - u1, v2 - v1]) > 1e-9:
+                segments_2d.append(LineString([(u1, v1), (u2, v2)]))
+
+        if not segments_2d:
+            return None
+
+        merged = linemerge(segments_2d)
+        if merged.is_empty:
+            return None
+
+        polys = list(polygonize(merged))
+        if not polys:
+            # Fallback to convex hull of all endpoints
+            all_pts = []
+            for line in segments_2d:
+                all_pts.extend(line.coords)
+            pts = np.array(all_pts)
+            if len(pts) < 3:
+                return None
+            try:
+                hull = ConvexHull(pts)
+                poly = ShapelyPolygon(pts[hull.vertices])
+            except Exception:
+                return None
+        else:
+            poly = max(polys, key=lambda p: p.area)
+
+        if poly.is_empty or poly.area < 1e-8:
+            return None
+
+        # Build 4x4 transform (u_ax, v_ax, origin)
+        to_3d = np.eye(4)
+        to_3d[:3, 0] = u_ax
+        to_3d[:3, 1] = v_ax
+        to_3d[:3, 3] = origin
+
+        return poly, to_3d
+
+    # ---- Main loop over ribs ----
+    all_vertices = []
+    all_faces = []
+    vert_offset = 0
+    total_slices, valid_slices = 0, 0
+
+    for i, ld_i in enumerate(lines_data):
         if ld_i is None:
             continue
 
-        p_i = ld_i['point']
-        d_i = ld_i['dir']          # unit rib direction (3D)
+        p0 = ld_i['point']
+        dir_rib = ld_i['dir']
+        print(f"\nRib {i}: p0={p0}, dir={dir_rib}")
 
-        # ---- Rib plane normal ----
-        N_i = np.cross(d_i, plane_normal_np)
-        if np.linalg.norm(N_i) < 1e-8:
-            continue
-        N_i /= np.linalg.norm(N_i)
+        ribbon_pts = []
+        d = d_min
+        while d <= d_max + 1e-9:
+            # plane position is at coordinate d along the primary direction
+            plane_origin = d * prim
+            total_slices += 1
 
-        # ---- 1. Wing cross‑section polygon + local 2D transform ----
-        try:
-            section = wing_mesh.section(plane_origin=p_i, plane_normal=N_i)
-        except Exception:
-            continue
-        if section is None:
-            continue
-        try:
-            planar, to_3d = section.to_planar()
-        except Exception:
-            continue
-        polygons = planar.polygons_full
-        if not polygons:
-            continue
-        wing_poly = polygons[0]          # outer boundary
-        if wing_poly.is_empty or wing_poly.area < 1e-8:
-            continue
-
-        # Local 2D basis from the transform
-        to_3d_mat = np.array(to_3d)      # (4,4)
-        u_ax = to_3d_mat[:3, 0]          # local X axis (3D)
-        v_ax = to_3d_mat[:3, 1]          # local Y axis (3D)
-        origin_3d = to_3d_mat[:3, 3]
-
-        # ---- 2. Project wing polygon and rib direction into local 2D ----
-        xy = np.array(wing_poly.exterior.coords)        # (N,2)
-        ones = np.ones((len(xy), 1))
-        xy_h = np.hstack([xy, np.zeros((len(xy), 1)), ones])
-        pts_3d = (to_3d_mat @ xy_h.T).T[:, :3]
-
-        # Map polygon to 2D
-        u_wing = np.dot(pts_3d - origin_3d, u_ax)
-        v_wing = np.dot(pts_3d - origin_3d, v_ax)
-        wing_uv = ShapelyPolygon(np.column_stack([u_wing, v_wing]))
-        if wing_uv.is_empty or wing_uv.area < 1e-8:
-            continue
-
-        # Project the rib direction d_i into 2D
-        rib_dir_2d = np.array([np.dot(d_i, u_ax), np.dot(d_i, v_ax)])
-        norm_2d = np.linalg.norm(rib_dir_2d)
-        if norm_2d < 1e-8:
-            continue
-        rib_dir_2d /= norm_2d
-        # Perpendicular direction (for bridge half‑width)
-        perp_2d = np.array([-rib_dir_2d[1], rib_dir_2d[0]])
-
-        # ---- 3. Find crossing u‑coordinates (in local 2D, using rib_dir_2d) ----
-        # We need the position along rib_dir_2d for crossing lines.
-        crossing_t = []  # parameter along rib_dir_2d
-        for j, ld_j in enumerate(lines_data):
-            if j == i or ld_j is None:
+            res = wing_poly_at_plane(plane_origin)
+            if res is None:
+                d += z_step
                 continue
-            if abs(np.dot(d_i, ld_j['dir'])) > 0.9999:
+            wing_poly, to_3d_mat = res
+
+            # Convert polygon to 2D local coordinates (u, v)
+            xy = np.array(wing_poly.exterior.coords)
+            wing_uv = ShapelyPolygon(xy)
+
+            # Rib direction projected to 2D
+            rib_dir_2d = np.array([np.dot(dir_rib, u_ax), np.dot(dir_rib, v_ax)])
+            norm_2d = np.linalg.norm(rib_dir_2d)
+            if norm_2d < 1e-8:
+                d += z_step
                 continue
-            pt = intersect_lines(p_i, d_i, ld_j['point'], ld_j['dir'])
-            if pt is None:
+            rib_dir_2d /= norm_2d
+
+            # Intersection of the 3D rib line with the slice plane
+            denom = np.dot(prim, dir_rib)
+            if abs(denom) < 1e-8:
+                d += z_step
                 continue
-            # 2D coordinates of the intersection point
-            uv_pt = np.array([np.dot(pt - origin_3d, u_ax),
-                              np.dot(pt - origin_3d, v_ax)])
-            # Project onto rib_dir_2d to get the t parameter
-            t = np.dot(uv_pt, rib_dir_2d)
-            crossing_t.append(t)
+            t_plane = np.dot(prim, plane_origin - p0) / denom
+            P_3d = p0 + t_plane * dir_rib
 
-        # Get the t-range of the wing polygon
-        t_wing = np.dot(np.column_stack([u_wing, v_wing]), rib_dir_2d)
-        t_min = t_wing.min() - 10.0
-        t_max = t_wing.max() + 10.0
-        crossing_t.extend([t_min, t_max])
-        crossing_t = sorted(set(crossing_t))
+            # 2D coordinates of the rib intersection point
+            P_uv = np.array([np.dot(P_3d - plane_origin, u_ax),
+                             np.dot(P_3d - plane_origin, v_ax)])
 
-        # ---- 4. For each interval along rib_dir, build a bridge strip ----
-        for k in range(len(crossing_t)-1):
-            t0 = crossing_t[k]
-            t1 = crossing_t[k+1]
-            if t1 - t0 < 1e-8:
-                continue
-
-            # Cell polygon = wing_uv ∩ strip bounded by lines t = t0 and t = t1
-            # Define the two bounding lines
-            # Line perpendicular to rib_dir_2d, passing through points with t=t0,t1
-            # point on line: P = t0 * rib_dir_2d + s * perp_2d
-            # We can create a huge rectangle that covers the cell extent in perp direction.
-            # Get perpendicular extent of wing_uv
-            perp_wing = np.dot(np.column_stack([u_wing, v_wing]), perp_2d)
-            p_min = perp_wing.min() - 10.0
-            p_max = perp_wing.max() + 10.0
-
-            # Rectangle aligned with rib_dir_2d, spanning [t0,t1] along rib and [p_min,p_max] along perp
-            # Four corners in order: (t0,p_min), (t1,p_min), (t1,p_max), (t0,p_max)
-            corners = [
-                (t0, p_min), (t1, p_min), (t1, p_max), (t0, p_max)
-            ]
-            # Transform to (u,v) coordinates: (u,v) = t*rib_dir_2d + p*perp_2d
-            rect_pts = []
-            for (t_val, p_val) in corners:
-                pt = t_val * rib_dir_2d + p_val * perp_2d
-                rect_pts.append(pt)
-            rect = ShapelyPolygon(rect_pts)
-
+            # Find chord through P_uv along rib_dir_2d
+            extent = 1e5
+            line = LineString([P_uv - extent * rib_dir_2d, P_uv + extent * rib_dir_2d])
             try:
-                cell = wing_uv.intersection(rect)
+                chord = wing_uv.intersection(line)
             except Exception:
+                d += z_step
                 continue
-            if cell.is_empty:
-                continue
-            if cell.geom_type == 'Polygon':
-                cells = [cell]
-            elif cell.geom_type == 'MultiPolygon':
-                cells = list(cell.geoms)
-            else:
+            if chord.is_empty:
+                d += z_step
                 continue
 
-            for c in cells:
-                if c.is_empty or c.area < 1e-8:
-                    continue
-                # Build the bridge strip: narrow rectangle centred on the midline t_mid = (t0+t1)/2
-                t_mid = (t0 + t1) / 2.0
-                # Half‑width along rib_dir_2d is bridge_height (since bridge_height is half-length along the rib direction)
-                # But the cell width is t1 - t0; we want a strip narrower than the cell.
-                # Use bridge_height as the half‑width along the rib direction.
-                half_w = min(bridge_height, (t1 - t0) * 0.4)  # ensure it doesn't exceed cell
-                t_left = t_mid - half_w
-                t_right = t_mid + half_w
+            # If multiple segments, pick the one containing P
+            if chord.geom_type == 'MultiLineString':
+                best_seg = None
+                min_dist = np.inf
+                for seg in chord.geoms:
+                    dist = seg.distance(Point(P_uv))
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_seg = seg
+                chord = best_seg
+            if chord is None or chord.is_empty:
+                d += z_step
+                continue
 
-                # Rectangle for the bridge strip: aligned with rib_dir_2d, from t_left to t_right
-                strip_corners = [
-                    (t_left, p_min), (t_right, p_min), (t_right, p_max), (t_left, p_max)
-                ]
-                strip_pts = []
-                for (t_val, p_val) in strip_corners:
-                    pt = t_val * rib_dir_2d + p_val * perp_2d
-                    strip_pts.append(pt)
-                strip_rect = ShapelyPolygon(strip_pts)
+            # Chord endpoints and the position of P along the direction
+            coords = np.array(chord.coords)
+            t_vals = np.dot(coords, rib_dir_2d)
+            t_min, t_max = t_vals.min(), t_vals.max()
+            t_center = np.dot(P_uv, rib_dir_2d)
 
-                # Intersect the strip with the cell
-                try:
-                    bridge_poly = c.intersection(strip_rect)
-                except Exception:
-                    continue
-                if bridge_poly.is_empty:
-                    continue
+            # Build bridge segment centered on the rib intersection, clipped to chord
+            half_w = bridge_height
+            t_left  = max(t_center - half_w, t_min)
+            t_right = min(t_center + half_w, t_max)
 
-                if bridge_poly.geom_type == 'Polygon':
-                    bridges = [bridge_poly]
-                elif bridge_poly.geom_type == 'MultiPolygon':
-                    bridges = list(bridge_poly.geoms)
-                else:
-                    continue
+            seg_start_uv = t_left  * rib_dir_2d
+            seg_end_uv   = t_right * rib_dir_2d
 
-                for bp in bridges:
-                    if bp.is_empty or bp.area < 1e-8:
-                        continue
-                    try:
-                        verts2d, faces = trimesh.creation.triangulate_polygon(bp)
-                    except Exception:
-                        continue
-                    if len(verts2d) == 0 or len(faces) == 0:
-                        continue
+            # 2D → 3D
+            def uv_to_3d(uv):
+                pt = np.array([uv[0], uv[1], 0.0, 1.0])
+                pt3d = to_3d_mat @ pt
+                return pt3d[:3]
 
-                    verts_h = np.column_stack([verts2d, np.zeros(len(verts2d)), np.ones(len(verts2d))])
-                    verts3d = (to_3d_mat @ verts_h.T).T[:, :3]
-                    mesh = trimesh.Trimesh(vertices=verts3d, faces=faces, process=False)
-                    mesh.fix_normals()
-                    all_bridge_meshes.append(mesh)
+            pt_left  = uv_to_3d(seg_start_uv)
+            pt_right = uv_to_3d(seg_end_uv)
 
-    print(f"Created {len(all_bridge_meshes)} bridge triangles.")
+            ribbon_pts.append((d, pt_left, pt_right))
+            valid_slices += 1
+            d += z_step
 
-    if not all_bridge_meshes:
+        print(f"  Rib {i}: collected {len(ribbon_pts)} ribbon points")
+
+        # Build quad mesh for this rib
+        if len(ribbon_pts) >= 2:
+            ribbon_pts.sort(key=lambda x: x[0])  # sort by d
+            for k in range(len(ribbon_pts) - 1):
+                _, L1, R1 = ribbon_pts[k]
+                _, L2, R2 = ribbon_pts[k+1]
+                v0 = vert_offset
+                v1 = vert_offset + 1
+                v2 = vert_offset + 2
+                v3 = vert_offset + 3
+                all_vertices.extend([L1, R1, R2, L2])
+                all_faces.append([v0, v1, v2])
+                all_faces.append([v0, v2, v3])
+                vert_offset += 4
+
+    print(f"\nTotal slices: {total_slices}, valid: {valid_slices}")
+    print(f"Total vertices: {len(all_vertices)}")
+
+    if not all_vertices:
+        print("No bridge geometry generated.")
         return None
 
-    bridges_mesh = trimesh.util.concatenate(all_bridge_meshes)
+    verts_arr = np.array(all_vertices)
+    faces_arr = np.array(all_faces)
+    bridge_mesh = trimesh.Trimesh(vertices=verts_arr, faces=faces_arr, process=False)
+    bridge_mesh.merge_vertices()
+    bridge_mesh.fix_normals()
 
-    if vis and doc and bridges_mesh:
+    print(f"Bridge mesh: {len(bridge_mesh.vertices)} verts, {len(bridge_mesh.faces)} faces")
+
+    if vis and doc:
         try:
-            fc_mesh = trimesh_to_freecad(bridges_mesh)
+            fc_mesh = trimesh_to_freecad(bridge_mesh)
             if fc_mesh:
                 show_mesh(fc_mesh, doc, "Bridges",
                           color=(0.9, 0.7, 0.1), transparency=20)
@@ -259,4 +280,4 @@ def create_bridges_analytical(wing_mesh, all_lines_np, plane_normal_np,
         except Exception as e:
             print(f"Visualisation error: {e}")
 
-    return bridges_mesh
+    return bridge_mesh

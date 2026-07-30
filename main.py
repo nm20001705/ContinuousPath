@@ -124,9 +124,13 @@ def main(params):
     wing_mesh = shape_to_trimesh(wing_shape, deflection=0.5, angular=0.5)
     if wing_mesh is None:
         raise RuntimeError("Failed to convert wing to trimesh")
-    print(f"Wing mesh: {len(wing_mesh.vertices)} vertices, {len(wing_mesh.faces)} faces")
+    print(f"Wing bounds: {wing_mesh.bounds}")
     print(f"Is watertight: {wing_mesh.is_watertight}, is volume: {wing_mesh.is_volume}")
 
+    # Test section at center of bounding box
+    center = wing_mesh.bounds.mean(axis=0)
+    test_section = wing_mesh.section(plane_origin=center, plane_normal=[0,0,1])
+    print(f"Test section at center {center}: {test_section is not None}")
     # ---- Generate grid lines (numpy arrays) ----
     lines1, lines2 = create_angled_grid_lines(bb, params)
     all_lines_np = lines1 + lines2   # list of (start, end) numpy arrays
@@ -168,13 +172,19 @@ def main(params):
         doc=doc,
         vis=params.vis_rib_segments
     )
-
+    primary_dir_np = np.array([
+        params.primary_dir.x,
+        params.primary_dir.y,
+        params.primary_dir.z
+    ])
+    primary_dir_np /= np.linalg.norm(primary_dir_np)
+    
     # Build bridges
     bridge_mesh = create_bridges_analytical(
         wing_mesh,
         all_lines_np,
-        plane_normal_np,
-        z_step=0.2,              # vertical increment
+        primary_dir_np,
+        z_step=1,              # vertical increment
         bridge_height=params.bridge_height,       # half-length of bridge segment
         doc=doc,
         vis=True                 # or use a parameter from LWInfillParams
@@ -203,7 +213,7 @@ if __name__ == "__main__":
         xy_rib_width=0.13,
         rib_angle=30.0,
         grid_orientation=0.0,
-        z_step=10,
+        z_step=0.2,
         primary_dir=FreeCAD.Vector(0, 0, 1),
         construction_plane='XZ',
         vis_cut_wing=False,
