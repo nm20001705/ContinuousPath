@@ -37,7 +37,35 @@ I need ne cut the ribs with each other and get the parts of the ribs.
 
 
 
-def create_bridges_analytical(point_condition:type funciton)
+def create_bridges_analytical()
+    bridges = []
+    for rib in ribs:
+        points_for_bridge = []
+        rib_surface = build_analytical_ribsurface_equation
+        z_min, z_max = get_bound(rib) # the distance only in the z direction
+        for z in range(z_min, z_max, dz):
+            slice = slice_slice_wing_at(z)
+            rib_intersection = get_rib_intersection_in_z(z, ribsurface, slice)
+            start_point, end_point = get_start_and_endpoint_of_line_segemnt(rib_intersection) # here you did not understand
+            center_point = get_center_from_two_points(strt_point, end_point)
+            point1 = offset_point_on_line(centerpoint, rib_intersection, 0.5*rib_height)
+            point2 = offset_point_on_line(centerpoint, rib_intersection, -0.5*rib_height)
+            points_for_bridge.append([p1, p2])
+        bridge = make bridge_mesh_from_points(points_for_bridge)
+        bridges.append(bridge)
+
+
+def get_start_and_endpoint_of_line_segemnt(rib_intersection)
+    # rib intersection is a line segment representing the rib intersection with the wing at the z slice.
+    # the start and endpoint is the sart and endpoint of the ribintersection with the wing and not the start and end of the slab itself.
+    # so the start and endpoint lie on the wingsurface.
+    return start_point, end_point
+
+
+
+
+
+def create_holes_analytical(point_condition:type funciton)
     bridges = []
     for rib_part in rib_parts:
         points_for_bridge = []

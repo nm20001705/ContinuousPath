@@ -52,7 +52,6 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
 
         ribbon_pts = []
 
-        # Find start and end indices in the slice arrays
         start_idx = np.searchsorted(z_vals, d_min)
         end_idx = np.searchsorted(z_vals, d_max, side='right')
 
@@ -69,10 +68,10 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
             P_uv = np.array([np.dot(P_3d - d * prim, u_ax),
                              np.dot(P_3d - d * prim, v_ax)])
 
+            # Build 2D wing polygon (needed for chord search)
             wing_uv = ShapelyPolygon(np.array(wing_poly.exterior.coords))
-            if not wing_uv.contains(Point(P_uv)):
-                continue
 
+            # Find chord along bridge_dir_2d through P_uv
             extent = 1e5
             line = LineString([P_uv - extent * bridge_dir_2d, P_uv + extent * bridge_dir_2d])
             try:
@@ -95,16 +94,26 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
                 continue
 
             coords = np.array(chord.coords)
+            # Discard degenerate chords (length ≈ 0)
+            if len(coords) < 2 or np.linalg.norm(coords[-1] - coords[0]) < 1e-6:
+                continue
+
+            # ---- Midpoint of the chord ----
+            midpoint_uv = (coords[0] + coords[-1]) / 2.0
+            # Midpoint guard: discard if midpoint is not inside the wing (with tiny tolerance)
+            if not wing_uv.buffer(1e-6).contains(Point(midpoint_uv)):
+                continue
+
             t_vals = np.dot(coords, bridge_dir_2d)
             t_min, t_max = t_vals.min(), t_vals.max()
-            t_center = np.dot(P_uv, bridge_dir_2d)
+            t_center = np.dot(midpoint_uv, bridge_dir_2d)
 
             half_w = bridge_height
             t_start = max(t_center - half_w, t_min)
             t_end   = min(t_center + half_w, t_max)
 
-            seg_start_uv = P_uv + (t_start - t_center) * bridge_dir_2d
-            seg_end_uv   = P_uv + (t_end   - t_center) * bridge_dir_2d
+            seg_start_uv = midpoint_uv + (t_start - t_center) * bridge_dir_2d
+            seg_end_uv   = midpoint_uv + (t_end   - t_center) * bridge_dir_2d
 
             def uv_to_3d(uv):
                 pt = np.array([uv[0], uv[1], 0.0, 1.0])
@@ -115,6 +124,7 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
             pt_right = uv_to_3d(seg_end_uv)
             ribbon_pts.append((d, pt_left, pt_right))
 
+        # Build quad mesh for this segment
         if len(ribbon_pts) >= 2:
             ribbon_pts.sort(key=lambda x: x[0])
             for k in range(len(ribbon_pts) - 1):

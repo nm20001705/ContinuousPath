@@ -101,26 +101,25 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
 # Mesh repair (from your pure Python script)
 # ------------------------------------------------------------
 def repair_mesh(mesh):
+    """
+    Minimal repair that fixes only small defects while preserving
+    intentional holes (servo cutouts, lightening holes).
+    """
     if mesh is None:
         return None
     if isinstance(mesh, trimesh.Scene):
         meshes = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
         if not meshes:
             return None
-        if len(meshes) == 1:
-            mesh = meshes[0]
-        else:
-            mesh = trimesh.util.concatenate(meshes)
-            if mesh is None:
-                return None
-    if not isinstance(mesh, trimesh.Trimesh):
+        mesh = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+        if mesh is None:
+            return None
+    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
         return None
-    if len(mesh.faces) == 0:
-        return None
+
+    # Safe, non‑shape‑altering operations
     try:
-        merged = mesh.merge_vertices()
-        if merged is not None:
-            mesh = merged
+        mesh.merge_vertices()
     except:
         pass
     try:
@@ -131,33 +130,20 @@ def repair_mesh(mesh):
         mesh.fix_normals()
     except:
         pass
-    for max_hole in [0.01, 0.05, 0.1, 0.5, 1.0]:
-        try:
-            repaired = trimesh.repair.fill_holes(mesh, max_hole=max_hole)
-            if repaired is not None and repaired.is_watertight:
-                mesh = repaired
-                break
-        except:
-            continue
+
+    # Fill only very small holes (≤0.1 mm) to fix mesh defects without closing
+    # intentional cutouts which are typically much larger.
     try:
-        trimesh.repair.wind_watertight(mesh)
+        mesh = trimesh.repair.fill_holes(mesh, max_hole=0.1)
     except:
         pass
-    try:
-        trimesh.repair.broken_faces(mesh)
-    except:
-        pass
+
+    # Re‑apply normals after hole filling
     try:
         mesh.fix_normals()
     except:
         pass
-    if not mesh.is_watertight:
-        try:
-            hull = trimesh.convex.convex_hull(mesh.vertices)
-            if hull.is_watertight:
-                mesh = hull
-        except:
-            pass
+
     return mesh
 
 # ------------------------------------------------------------
@@ -320,7 +306,6 @@ def create_rib_surfaces_trimesh(wing_mesh, rib_center_lines_np, plane_normal_np,
         faces = np.array([[0, 1, 2], [0, 2, 3]])
         mesh = trimesh.Trimesh(vertices=verts, faces=faces)
         surfaces.append(mesh)
-        print(f"Rib {i}: rectangle created")
 
     print(f"Total surfaces created: {len(surfaces)}")
 

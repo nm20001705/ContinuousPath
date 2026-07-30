@@ -1,4 +1,4 @@
-# main.py – fully optimised with cached wing slices
+# main.py – fully optimised with cached wing slices and pickle persistence
 
 from types import SimpleNamespace
 import FreeCAD
@@ -9,6 +9,11 @@ import trimesh
 from shapely.geometry import LineString, Polygon as ShapelyPolygon
 from shapely.ops import linemerge, polygonize
 from scipy.spatial import ConvexHull
+from tqdm import tqdm
+import pickle
+import os
+from slab_utils import trimesh_to_freecad
+from viz_utils import show_mesh
 
 from slab_utils import (
     create_rib_surfaces_trimesh,
@@ -26,12 +31,6 @@ from viz_utils import fit_view, show_rib_centre_lines
 # Precompute wing cross‑sections for all Z‑slices
 # ------------------------------------------------------------
 def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
-    """
-    Returns
-    -------
-    z_vals : np.ndarray   – sorted Z coordinates of the slices
-    slices : list         – list of (polygon_2d, to_3d_matrix) for each Z
-    """
     if abs(prim[0]) > 0.9:
         u_ax = np.cross(prim, [0, 1, 0])
     else:
@@ -41,7 +40,8 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
 
     z_vals = []
     slices = []
-
+    num_steps = int((d_max - d_min) / z_step) + 1
+    pbar = tqdm(total=num_steps, desc="Precomputing slices")
     d = d_min
     while d <= d_max + 1e-9:
         plane_origin = d * prim
@@ -51,6 +51,7 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
             )
         except Exception:
             d += z_step
+            pbar.update(1)
             continue
         if isinstance(result, tuple):
             lines = result[0]
@@ -58,6 +59,7 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
             lines = result
         if lines is None or len(lines) == 0:
             d += z_step
+            pbar.update(1)
             continue
 
         origin = np.asarray(plane_origin)
@@ -72,10 +74,12 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
 
         if not segments_2d:
             d += z_step
+            pbar.update(1)
             continue
         merged = linemerge(segments_2d)
         if merged.is_empty:
             d += z_step
+            pbar.update(1)
             continue
         polys = list(polygonize(merged))
         if not polys:
@@ -85,18 +89,21 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
             pts = np.array(all_pts)
             if len(pts) < 3:
                 d += z_step
+                pbar.update(1)
                 continue
             try:
                 hull = ConvexHull(pts)
                 poly = ShapelyPolygon(pts[hull.vertices])
             except Exception:
                 d += z_step
+                pbar.update(1)
                 continue
         else:
             poly = max(polys, key=lambda p: p.area)
 
         if poly.is_empty or poly.area < 1e-8:
             d += z_step
+            pbar.update(1)
             continue
 
         to_3d = np.eye(4)
@@ -107,8 +114,11 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
         z_vals.append(d)
         slices.append((poly, to_3d))
         d += z_step
+        pbar.update(1)
 
+    pbar.close()
     return np.array(z_vals), slices
+
 
 # ------------------------------------------------------------
 # Main function
@@ -159,10 +169,38 @@ def main(params):
     d_min = proj.min() - 1e-3
     d_max = proj.max() + 1e-3
 
-    # ---- Precompute all Z-slices (once!) ----
-    print("Precomputing wing slices...")
-    z_vals, slices = precompute_slices(wing_mesh, primary_dir_np, params.z_step, d_min=d_min, d_max=d_max)
-    print(f"Precomputed {len(slices)} slices")
+    # ---- Precompute / load Z-slices from cache ----
+    cache_dir = os.path.dirname(params.doc_path) if params.doc_path else os.getcwd()
+    cache_filename = f"{params.obj_name}.pkl"
+    cache_path = os.path.join(cache_dir, cache_filename)
+
+    z_vals, slices = None, None
+    if os.path.exists(cache_path):
+        print(f"Loading cached slices from {cache_path}...")
+        try:
+            with open(cache_path, 'rb') as f:
+                data = pickle.load(f)
+            if data.get('z_step') == params.z_step:
+                z_vals = data['z_vals']
+                slices = data['slices']
+                print(f"Loaded {len(slices)} slices from cache.")
+            else:
+                print("Cached z_step differs from current; recomputing...")
+        except Exception as e:
+            print(f"Failed to load cache ({e}); recomputing...")
+
+    if z_vals is None:
+        print("Precomputing wing slices...")
+        z_vals, slices = precompute_slices(wing_mesh, primary_dir_np, params.z_step,
+                                           d_min=d_min, d_max=d_max)
+        print(f"Precomputed {len(slices)} slices")
+        # Save to cache
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump({'z_vals': z_vals, 'slices': slices, 'z_step': params.z_step}, f)
+            print(f"Slices cached to {cache_path}")
+        except Exception as e:
+            print(f"Warning: could not save slice cache: {e}")
 
     # ---- Generate rib centre lines ----
     bb = wing_shape.BoundBox
@@ -235,10 +273,10 @@ def main(params):
         wing_mesh,
         bridge_segments,
         primary_dir_np,
-        z_step=1,
+        z_step=params.z_step,
         bridge_height=params.bridge_height,
-        z_vals=z_vals,          # <-- new parameter
-        slices=slices,          # list, not dict
+        z_vals=z_vals,
+        slices=slices,
         doc=doc,
         vis=params.vis_bridge,
     )
@@ -251,9 +289,9 @@ def main(params):
         wing_mesh,
         bridge_segments,
         primary_dir_np,
-        z_step=1,
+        z_step=params.z_step,
         point_condition=hole_condition,
-        z_vals=z_vals,          # <-- new parameter
+        z_vals=z_vals,
         slices=slices,
         doc=doc,
         vis=params.vis_hole,
@@ -264,6 +302,17 @@ def main(params):
     if params.vis_centre_lines:
         show_rib_centre_lines(all_center_lines_fc, doc)
 
+    # ---- Show wing mesh (for debugging) ----
+    if params.vis_wing:
+        try:
+            wing_fc_mesh = trimesh_to_freecad(wing_mesh)
+            if wing_fc_mesh:
+                show_mesh(wing_fc_mesh, doc, "WingMesh",
+                          color=(0.5, 0.5, 0.5), transparency=50)
+                doc.recompute()
+                print("Wing mesh visualised.")
+        except Exception as e:
+            print(f"Wing mesh visualisation error: {e}")
     # ---- Save ----
     doc.save()
     print("Document saved.")
@@ -291,7 +340,8 @@ if __name__ == "__main__":
 
     params = SimpleNamespace(
         doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.FCStd",
-        obj_name='Part__Feature_solid',
+        # obj_name='Part__Feature_solid',
+        obj_name='WingR1_msv_orient001_solid',
         rib_spacing=20.0,
         rib_angle=30.0,
         grid_orientation=0.0,
@@ -305,7 +355,8 @@ if __name__ == "__main__":
         vis_centre_lines=False,
         vis_bridge=True,
         vis_hole=True,
-        z_step=0.2
+        z_step=0.2, 
+        vis_wing=True
     )
 
     params.plane_normal = pdef['normal']

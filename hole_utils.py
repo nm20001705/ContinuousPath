@@ -78,8 +78,6 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
                              np.dot(P_3d - d * prim, v_ax)])
 
             wing_uv = ShapelyPolygon(np.array(wing_poly.exterior.coords))
-            if not wing_uv.contains(Point(P_uv)):
-                continue
 
             extent = 1e5
             line = LineString([P_uv - extent * bridge_dir_2d, P_uv + extent * bridge_dir_2d])
@@ -103,15 +101,25 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
                 continue
 
             coords = np.array(chord.coords)
+            if len(coords) < 2 or np.linalg.norm(coords[-1] - coords[0]) < 1e-6:
+                continue
+
+            # ---- Midpoint of the chord ----
+            midpoint_uv = (coords[0] + coords[-1]) / 2.0
+            # Midpoint guard
+            if not wing_uv.buffer(1e-6).contains(Point(midpoint_uv)):
+                continue
+
             t_vals = np.dot(coords, bridge_dir_2d)
             t_min, t_max = t_vals.min(), t_vals.max()
 
+            # Apply margin to chord
             t_min_safe = t_min + hole_margin
             t_max_safe = t_max - hole_margin
             if t_min_safe >= t_max_safe:
                 continue
 
-            t_center = np.dot(P_uv, bridge_dir_2d)
+            t_center = np.dot(midpoint_uv, bridge_dir_2d)
             chord_half_effective = (t_max_safe - t_min_safe) / 2.0
 
             if segment_z_span > 1e-8:
@@ -124,8 +132,8 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
             t_start = max(t_center - half_w, t_min_safe)
             t_end   = min(t_center + half_w, t_max_safe)
 
-            seg_start_uv = P_uv + (t_start - t_center) * bridge_dir_2d
-            seg_end_uv   = P_uv + (t_end   - t_center) * bridge_dir_2d
+            seg_start_uv = midpoint_uv + (t_start - t_center) * bridge_dir_2d
+            seg_end_uv   = midpoint_uv + (t_end   - t_center) * bridge_dir_2d
 
             def uv_to_3d(uv):
                 pt = np.array([uv[0], uv[1], 0.0, 1.0])
