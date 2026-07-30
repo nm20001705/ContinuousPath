@@ -453,20 +453,12 @@ def clip_surfaces_to_solid(rib_center_lines_np, wing_mesh, plane_normal_np,
 def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
                                   doc=None, vis=False):
     """
-    Analitically build rib segments by intersecting a pre-built grid of
-    rectangles with the wing's exact cross‑section polygon.
-
-    Steps:
-    1. For each rib centre line, compute its intersection points with every
-       other line → segment boundaries.
-    2. Obtain the wing's cross‑section polygon on the rib plane using
-       wing_mesh.section() and to_planar().
-    3. Map all crossing points into the polygon's local 2D coordinates
-       (using the transformation matrix from to_planar).
-    4. For each interval between consecutive u-values, build a rectangle
-       in that same 2D space (interval horizontally, full polygon v-range).
-    5. Intersect rectangle with wing polygon, triangulate, and transform
-       back to 3D via the original 4x4 matrix.
+    Returns
+    -------
+    all_segments : list[trimesh.Trimesh]
+    segment_bounds : list[tuple]
+        Each tuple is (line_index, s_start, s_end) where s is the parameter
+        along the rib line defined by p0 + s * dir_rib.
     """
     # Precompute line data
     lines_data = []
@@ -496,13 +488,14 @@ def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
         return p_intersect
 
     all_segments = []
+    segment_bounds = []          # <-- new
 
     for i, (line_i, ld_i) in enumerate(zip(all_lines_np, lines_data)):
         if ld_i is None:
             continue
 
-        p_i = ld_i['point']      # start of line i
-        d_i = ld_i['dir']        # unit direction
+        p_i = ld_i['point']
+        d_i = ld_i['dir']
 
         # ---- 1. Collect crossing parameters (s) along the line ----
         crossing_params = []
@@ -510,7 +503,7 @@ def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
             if j == i or ld_j is None:
                 continue
             if abs(np.dot(d_i, ld_j['dir'])) > 0.9999:
-                continue   # parallel → skip
+                continue
             pt = intersect_lines(p_i, d_i, ld_j['point'], ld_j['dir'])
             if pt is None:
                 continue
@@ -551,53 +544,35 @@ def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
         if wing_poly.is_empty or wing_poly.area < 1e-8:
             continue
 
-        # Extract 2D‑to‑3D transformation details
-        # to_3d is a 4x4 matrix; we need its inverse to map 3D → local 2D
-        to_3d_mat = np.array(to_3d)   # shape (4,4)
-        # The last column is the plane origin (homogeneous)
+        to_3d_mat = np.array(to_3d)   # (4,4)
         origin_3d = to_3d_mat[:3, 3]
-        # The first two columns are the orthonormal basis vectors (u, v)
         u_poly = to_3d_mat[:3, 0]
         v_poly = to_3d_mat[:3, 1]
-        # Build inverse projection: point 3D → [u, v] = [ dot(P-O, u_poly), dot(P-O, v_poly) ]
+
         def project_to_local(pt3d):
             delta = pt3d - origin_3d
             return np.array([np.dot(delta, u_poly), np.dot(delta, v_poly)])
 
-        # ---- 3. Map the wing polygon to local 2D (already done, it's wing_poly) ----
-        # wing_poly is in local 2D coordinates; we can query its v‑range
         minx, miny, maxx, maxy = wing_poly.bounds
-        v_min = miny
-        v_max = maxy
+        v_min, v_max = miny, maxy
 
-        # ---- 4. Project crossing points into local 2D ----
-        # crossing_params are s values along d_i. We must map 3D points
-        # p_i + s * d_i to local 2D to get their u‑coordinate.
+        # Map crossing parameters to local u coordinates
         crossing_u = []
         for s in crossing_params:
             pt3d = p_i + s * d_i
             uv = project_to_local(pt3d)
-            crossing_u.append(uv[0])   # u‑coordinate in polygon's space
-
+            crossing_u.append(uv[0])
         crossing_u = sorted(set(crossing_u))
 
-        # ---- 5. For each interval, build a rectangle in polygon's 2D space ----
+        # ---- 3. For each interval, build a rectangle and intersect ----
         for k in range(len(crossing_u)-1):
             u0 = crossing_u[k]
             u1 = crossing_u[k+1]
             if u1 - u0 < 1e-8:
                 continue
 
-            # rectangle: [u0,u1] x [v_min, v_max]
-            rect_pts = [
-                (u0, v_min),
-                (u1, v_min),
-                (u1, v_max),
-                (u0, v_max)
-            ]
-            rect = ShapelyPolygon(rect_pts)
-
-            # Intersect with wing polygon
+            rect = ShapelyPolygon([(u0, v_min), (u1, v_min),
+                                   (u1, v_max), (u0, v_max)])
             try:
                 intersection = rect.intersection(wing_poly)
             except Exception:
@@ -624,7 +599,6 @@ def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
                 if len(verts2d) == 0 or len(faces) == 0:
                     continue
 
-                # Map back to 3D using the same to_3d matrix
                 verts_h = np.column_stack([verts2d, np.zeros(len(verts2d)), np.ones(len(verts2d))])
                 verts3d = (to_3d_mat @ verts_h.T).T[:, :3]
 
@@ -632,9 +606,12 @@ def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
                 seg_mesh.fix_normals()
                 all_segments.append(seg_mesh)
 
+                # ----- Record the segment bounds -----
+                segment_bounds.append((i, crossing_params[k], crossing_params[k+1]))
+
     print(f"Created {len(all_segments)} rib segments (analytical grid).")
 
-    # Visualisation
+    # Visualisation unchanged...
     if vis and doc and all_segments:
         try:
             combined = trimesh.util.concatenate(all_segments)
@@ -647,4 +624,4 @@ def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
         except Exception as e:
             print(f"Visualisation error: {e}")
 
-    return all_segments
+    return all_segments, segment_bounds

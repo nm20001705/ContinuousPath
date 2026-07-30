@@ -37,3 +37,38 @@ I need ne cut the ribs with each other and get the parts of the ribs.
 
 
 
+def create_bridges_analytical(point_condition:type funciton)
+    bridges = []
+    for rib_part in rib_parts:
+        points_for_bridge = []
+        rib_surface = build_analytical_ribsurface_equation()
+        z_min, z_max = get_bound(rib_part)
+        rib_height_in_z = z_max - z_min
+        hole_height_in_z = z_max - z_min - 2 * hole_marging
+        for z in range(z_min, z_max, dz):
+            if z > hole_marging and z < (rib_height_in_z-hole_margin):
+                slice = slice_slice_wing_at(z)
+                rib_intersection = get_rib_intersection_in_z(z, ribsurface, slice)
+                start_point, end_point = get_start_and_endpoint_of_line_segemnt(rib_intersection)
+                center_point = get_center_from_two_points(strt_point, end_point, end_point, hole_marging )
+                point1, point2 = make_points_from_condition(point_condition, rib_intersection, start_point, center_point, hole_height_in_z)
+                points_for_bridge.append([p1, p2])
+            
+        bridge = make bridge_mesh_from_points(points_for_bridge)
+        bridges.append(bridge)
+
+
+def make_points_from_condition(point_condition, rib_intersection, start_point, center_point, rib_height_in_z, hole_marging, hole_height_in_z):
+    distance_between_start_end = get_dist(start_point, center_point) - 2 * hole_marging
+    if distance_between_start_end < 0:
+        distance_between_start_end = 0
+    x = (rib_height_in_z-hole_marging) / hole_height_in_z # this is a relative measure between 0 and 1 on how far we are in the rib slicing
+    dist_relative = point_condition(x=x)
+    point1 = center_point + (distance_between_start_end/2)*dist_relative
+    point2 = center_point - (distance_between_start_end/2)*dist_relative
+    return point1, point2
+
+def point_condition(x):
+    """x and y must be numbers between 0 and 1"""
+    y = 0.5
+    return y

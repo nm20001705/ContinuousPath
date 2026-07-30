@@ -1,4 +1,4 @@
-# bridge_utils.py
+# hole_utils.py
 
 import FreeCAD
 import Part
@@ -16,25 +16,24 @@ from slab_utils import trimesh_to_freecad
 from shapely.ops import linemerge, polygonize
 from scipy.spatial import ConvexHull
 
-def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
-                              z_step=0.2, bridge_height=0.5,
-                              doc=None, vis=False):
+def create_holes(wing_mesh, rib_segments, primary_dir_np,
+                 z_step=0.2, point_condition=None, hole_margin=0.0,
+                 doc=None, vis=False):
     """
-    Build bridge ribbons for each rib segment.
+    Build hole ribbons inside each rib segment, with a safety margin from
+    the wing surface and from the top/bottom of the segment.
 
     Parameters
     ----------
-    wing_mesh : trimesh.Trimesh
-    rib_segments : list[dict]
-        Each dict must contain:
-            'p0' : numpy (3,) – start of segment (3D)
-            'p1' : numpy (3,) – end of segment (3D)
-            'dir' : numpy (3,) – unit direction along the rib
-            'slab_normal' : numpy (3,) – normal of the slab plane
+    hole_margin : float
+        Distance (in model units) to keep away from the wing surface (on both
+        sides of the chord) and from the top/bottom of the segment's Z extent.
     """
+    if point_condition is None:
+        point_condition = lambda x: 0.0
+
     prim = primary_dir_np / np.linalg.norm(primary_dir_np)
 
-    # ---- Fixed basis for slice plane ----
     if abs(prim[0]) > 0.9:
         u_ax = np.cross(prim, [0, 1, 0])
     else:
@@ -43,7 +42,7 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
     v_ax = np.cross(prim, u_ax)
 
     def wing_poly_at_plane(plane_origin):
-        """Return (2D polygon, 4x4 transform) or None."""
+        # ... identical to previous version ...
         try:
             result = trimesh.intersections.mesh_plane(
                 wing_mesh, plane_normal=prim, plane_origin=plane_origin
@@ -56,7 +55,6 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
             lines = result
         if lines is None or len(lines) == 0:
             return None
-
         origin = np.asarray(plane_origin)
         segments_2d = []
         for seg in lines:
@@ -66,7 +64,6 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
             u2, v2 = np.dot(p2, u_ax), np.dot(p2, v_ax)
             if np.linalg.norm([u2 - u1, v2 - v1]) > 1e-9:
                 segments_2d.append(LineString([(u1, v1), (u2, v2)]))
-
         if not segments_2d:
             return None
         merged = linemerge(segments_2d)
@@ -87,10 +84,8 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
                 return None
         else:
             poly = max(polys, key=lambda p: p.area)
-
         if poly.is_empty or poly.area < 1e-8:
             return None
-
         to_3d = np.eye(4)
         to_3d[:3, 0] = u_ax
         to_3d[:3, 1] = v_ax
@@ -100,6 +95,8 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
     all_vertices = []
     all_faces = []
     vert_offset = 0
+    num_holes = 0
+    total_segments = len(rib_segments)
 
     for seg in rib_segments:
         p0 = seg['p0']
@@ -107,13 +104,18 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
         dir_rib = seg['dir']
         slab_normal = seg['slab_normal']
 
-        # ----- Z range of this segment -----
         d0 = np.dot(p0, prim)
         d1 = np.dot(p1, prim)
         d_min = min(d0, d1)
         d_max = max(d0, d1)
 
-        # ----- Bridge direction (intersection of slab and slice) -----
+        # Apply Z margin
+        d_start = d_min + hole_margin
+        d_end   = d_max - hole_margin
+        if d_start >= d_end:
+            continue
+        segment_z_span = d_end - d_start   # used for normalised position
+
         line_dir_3d = np.cross(slab_normal, prim)
         norm_l = np.linalg.norm(line_dir_3d)
         if norm_l < 1e-8:
@@ -123,8 +125,8 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
         bridge_dir_2d /= np.linalg.norm(bridge_dir_2d)
 
         ribbon_pts = []
-        d = d_min
-        while d <= d_max + 1e-9:
+        d = d_start
+        while d <= d_end + 1e-9:
             plane_origin = d * prim
             res = wing_poly_at_plane(plane_origin)
             if res is None:
@@ -132,25 +134,21 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
                 continue
             wing_poly, to_3d_mat = res
 
-            # Intersection of rib line with this slice plane
             denom = np.dot(prim, dir_rib)
             if abs(denom) < 1e-8:
                 d += z_step
                 continue
-            t_plane = np.dot(prim, plane_origin - p0) / denom   # using p0 as reference
+            t_plane = np.dot(prim, plane_origin - p0) / denom
             P_3d = p0 + t_plane * dir_rib
 
-            # 2D coordinates
             P_uv = np.array([np.dot(P_3d - plane_origin, u_ax),
                              np.dot(P_3d - plane_origin, v_ax)])
 
-            # Optional safety: ensure P_uv lies inside wing cross‑section
             wing_uv = ShapelyPolygon(np.array(wing_poly.exterior.coords))
             if not wing_uv.contains(Point(P_uv)):
                 d += z_step
                 continue
 
-            # Find chord along bridge_dir_2d through P_uv
             extent = 1e5
             line = LineString([P_uv - extent * bridge_dir_2d, P_uv + extent * bridge_dir_2d])
             try:
@@ -178,11 +176,26 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
             coords = np.array(chord.coords)
             t_vals = np.dot(coords, bridge_dir_2d)
             t_min, t_max = t_vals.min(), t_vals.max()
-            t_center = np.dot(P_uv, bridge_dir_2d)
 
-            half_w = bridge_height
-            t_start = max(t_center - half_w, t_min)
-            t_end   = min(t_center + half_w, t_max)
+            # Shrink chord by hole_margin on each side
+            t_min_safe = t_min + hole_margin
+            t_max_safe = t_max - hole_margin
+            if t_min_safe >= t_max_safe:
+                d += z_step
+                continue
+
+            t_center = np.dot(P_uv, bridge_dir_2d)
+            chord_half_effective = (t_max_safe - t_min_safe) / 2.0
+
+            if segment_z_span > 1e-8:
+                x = (d - d_start) / segment_z_span   # 0..1
+            else:
+                x = 0.0
+            factor = point_condition(x)
+            half_w = factor * chord_half_effective
+
+            t_start = max(t_center - half_w, t_min_safe)
+            t_end   = min(t_center + half_w, t_max_safe)
 
             seg_start_uv = P_uv + (t_start - t_center) * bridge_dir_2d
             seg_end_uv   = P_uv + (t_end   - t_center) * bridge_dir_2d
@@ -194,12 +207,11 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
 
             pt_left  = uv_to_3d(seg_start_uv)
             pt_right = uv_to_3d(seg_end_uv)
-
             ribbon_pts.append((d, pt_left, pt_right))
             d += z_step
 
-        # Build quad mesh for this segment
         if len(ribbon_pts) >= 2:
+            num_holes += 1
             ribbon_pts.sort(key=lambda x: x[0])
             for k in range(len(ribbon_pts) - 1):
                 _, L1, R1 = ribbon_pts[k]
@@ -214,26 +226,27 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
                 vert_offset += 4
 
     if not all_vertices:
-        print("No bridge geometry generated.")
+        print("No hole geometry generated.")
         return None
 
     verts_arr = np.array(all_vertices)
     faces_arr = np.array(all_faces)
-    bridge_mesh = trimesh.Trimesh(vertices=verts_arr, faces=faces_arr, process=False)
-    bridge_mesh.merge_vertices()
-    bridge_mesh.fix_normals()
+    hole_mesh = trimesh.Trimesh(vertices=verts_arr, faces=faces_arr, process=False)
+    hole_mesh.merge_vertices()
+    hole_mesh.fix_normals()
 
-    print(f"Bridge mesh: {len(bridge_mesh.vertices)} verts, {len(bridge_mesh.faces)} faces")
+    print(f"Hole mesh: {len(hole_mesh.vertices)} verts, {len(hole_mesh.faces)} faces")
+    print(f"Holes created: {num_holes} out of {total_segments} rib segments")
 
     if vis and doc:
         try:
-            fc_mesh = trimesh_to_freecad(bridge_mesh)
+            fc_mesh = trimesh_to_freecad(hole_mesh)
             if fc_mesh:
-                show_mesh(fc_mesh, doc, "Bridges",
-                          color=(0.9, 0.7, 0.1), transparency=20)
+                show_mesh(fc_mesh, doc, "Holes",
+                          color=(0.1, 0.1, 0.1), transparency=80)
                 doc.recompute()
-                print("Bridges visualised.")
+                print("Holes visualised.")
         except Exception as e:
             print(f"Visualisation error: {e}")
 
-    return bridge_mesh
+    return hole_mesh

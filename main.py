@@ -19,6 +19,8 @@ from bridge_utils import create_bridges_analytical
 
 from viz_utils import fit_view, show_rib_centre_lines
 
+from hole_utils import create_holes
+
 # ---- PLANE_DEFS and LWInfillParams (with create_holes) ----
 PLANE_DEFS = {
     'XY': {'normal': FreeCAD.Vector(0, 0, 1),
@@ -38,7 +40,7 @@ class LWInfillParams:
                  doc_path=r"C:\Users\natha\git\ContinuousPath\wing.FCStd",
                  obj_name='Pad',
                  rib_spacing=5.0, xy_rib_width=0.1, rib_width=None, rib_angle=30.0,
-                 grid_orientation=0.0, primary_dir=None, z_step=10, cutout_marging=2,
+                 grid_orientation=0.0, primary_dir=None, z_step=10, hole_margin =2,
                  construction_plane='XZ',
                  vis_cut_wing=True, vis_rib_centre_surfaces=True,
                  vis_centre_lines=True, vis_midpoints=True,
@@ -49,7 +51,8 @@ class LWInfillParams:
                  vis_rib_centre_surfaces_clip=True, 
                  vis_rib_segments=True, 
                  bridge_height=0.4, 
-                 vis_bridge=True):
+                 vis_bridge=True, 
+                 vis_hole=True):
         if construction_plane not in PLANE_DEFS:
             raise ValueError(f"construction_plane must be one of {list(PLANE_DEFS.keys())}")
         self.nozzle_diameter = nozzle_diameter
@@ -68,7 +71,7 @@ class LWInfillParams:
         self.plane_axis_v = pdef['axis_v']
         self.primary_dir = self._project_primary(primary_dir)
         self.z_step = z_step
-        self.cutout_marging = cutout_marging
+        self.hole_margin  = hole_margin 
         self.vis_cut_wing = vis_cut_wing
         self.vis_centre_lines = vis_centre_lines
         self.vis_midpoints = vis_midpoints
@@ -83,6 +86,7 @@ class LWInfillParams:
         self.vis_rib_segments=vis_rib_segments
         self.bridge_height=bridge_height
         self.vis_bridge=vis_bridge
+        self.vis_hole=vis_hole
         if xy_rib_width:
             self.rib_width = xy_rib_width / math.sin(math.radians(90-rib_angle))
         else:
@@ -146,6 +150,13 @@ def main(params):
 
     # ---- Create rib centre surfaces using fast FreeCAD section + meshing ----
     plane_normal_np = np.array([params.plane_normal.x, params.plane_normal.y, params.plane_normal.z])
+    primary_dir_np = np.array([
+        params.primary_dir.x,
+        params.primary_dir.y,
+        params.primary_dir.z
+    ])
+    primary_dir_np /= np.linalg.norm(primary_dir_np)
+
     rib_faces = create_rib_surfaces_trimesh(
         wing_mesh,
         all_lines_np,
@@ -166,31 +177,64 @@ def main(params):
 
     active_lines = [all_lines_np[i] for i in rib_indices]
 
-    # Now split
-    rib_segments = build_rib_segments_analytical(
+    rib_segments, segment_bounds = build_rib_segments_analytical(
         wing_mesh,
         all_lines_np,
         plane_normal_np,
         doc=doc,
         vis=params.vis_rib_segments
     )
-    primary_dir_np = np.array([
-        params.primary_dir.x,
-        params.primary_dir.y,
-        params.primary_dir.z
-    ])
-    primary_dir_np /= np.linalg.norm(primary_dir_np)
-    
-    # Build bridges
+
+    # Precompute slab normals for each rib line
+    lines_data = []
+    for (start, end) in all_lines_np:
+        d = end - start
+        if np.linalg.norm(d) < 1e-8:
+            lines_data.append(None)
+            continue
+        dir_rib = d / np.linalg.norm(d)
+        slab_normal = np.cross(dir_rib, plane_normal_np)
+        slab_normal /= np.linalg.norm(slab_normal)
+        lines_data.append({'point': start, 'dir': dir_rib, 'slab_normal': slab_normal})
+
+    # Convert segment_bounds into the list of dictionaries needed by create_bridges_analytical
+    bridge_segments = []
+    for (line_idx, s0, s1) in segment_bounds:
+        ld = lines_data[line_idx]
+        p0 = ld['point'] + s0 * ld['dir']
+        p1 = ld['point'] + s1 * ld['dir']
+        bridge_segments.append({
+            'p0': p0,
+            'p1': p1,
+            'dir': ld['dir'],
+            'slab_normal': ld['slab_normal']
+        })
+
+    # Create bridges
     bridge_mesh = create_bridges_analytical(
         wing_mesh,
-        all_lines_np,
+        bridge_segments,
         primary_dir_np,
-        z_step=params.z_step,                       # your chosen step
+        z_step=1,
         bridge_height=params.bridge_height,
-        construction_plane_normal=plane_normal_np,   # <-- ADD THIS
         doc=doc,
-        vis=True
+        vis=params.vis_bridge
+    )
+
+    # Define your condition – e.g. constant 50% of chord half‑length
+    def hole_condition(x):
+        """f(0)=0, f(0.5)=1, f(0.5)=1, f(1)=0, f(1)=0"""
+        return np.sqrt(max(0, 1 - (2*x - 1)**2))
+
+    hole_mesh = create_holes(
+        wing_mesh,
+        bridge_segments,          # same segments as bridges
+        primary_dir_np,
+        z_step=1,
+        point_condition=hole_condition,
+        doc=doc,
+        vis=params.vis_hole, 
+        hole_margin=params.hole_margin
     )
 
     # ---- Show centre lines if requested ----
@@ -229,9 +273,10 @@ if __name__ == "__main__":
         vis_rib_surface_segments=False,
         vis_final_solid=False,
         vis_rect_cutouts=True,
-        cutout_marging=0,
+        hole_margin = 0.5,
         create_holes=False,    # set to True if you want cutouts
         vis_rib_segments = True, 
-        vis_bridge = True
+        vis_bridge = True, 
+        vis_hole = True
     )
     main(params)
