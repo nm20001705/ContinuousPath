@@ -48,7 +48,8 @@ class LWInfillParams:
                  create_holes=True, 
                  vis_rib_centre_surfaces_clip=True, 
                  vis_rib_segments=True, 
-                 bridge_height=0.4):
+                 bridge_height=0.4, 
+                 vis_bridge=True):
         if construction_plane not in PLANE_DEFS:
             raise ValueError(f"construction_plane must be one of {list(PLANE_DEFS.keys())}")
         self.nozzle_diameter = nozzle_diameter
@@ -81,6 +82,7 @@ class LWInfillParams:
         self.vis_rib_centre_surfaces_clip=vis_rib_centre_surfaces_clip
         self.vis_rib_segments=vis_rib_segments
         self.bridge_height=bridge_height
+        self.vis_bridge=vis_bridge
         if xy_rib_width:
             self.rib_width = xy_rib_width / math.sin(math.radians(90-rib_angle))
         else:
@@ -184,10 +186,11 @@ def main(params):
         wing_mesh,
         all_lines_np,
         primary_dir_np,
-        z_step=1,              # vertical increment
-        bridge_height=params.bridge_height,       # half-length of bridge segment
+        z_step=params.z_step,                       # your chosen step
+        bridge_height=params.bridge_height,
+        construction_plane_normal=plane_normal_np,   # <-- ADD THIS
         doc=doc,
-        vis=True                 # or use a parameter from LWInfillParams
+        vis=True
     )
 
     # ---- Show centre lines if requested ----
@@ -213,7 +216,7 @@ if __name__ == "__main__":
         xy_rib_width=0.13,
         rib_angle=30.0,
         grid_orientation=0.0,
-        z_step=0.2,
+        z_step=1,
         primary_dir=FreeCAD.Vector(0, 0, 1),
         construction_plane='XZ',
         vis_cut_wing=False,
@@ -228,6 +231,7 @@ if __name__ == "__main__":
         vis_rect_cutouts=True,
         cutout_marging=0,
         create_holes=False,    # set to True if you want cutouts
-        vis_rib_segments = True
+        vis_rib_segments = True, 
+        vis_bridge = True
     )
     main(params)

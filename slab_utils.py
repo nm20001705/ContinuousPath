@@ -422,8 +422,6 @@ def clip_surfaces_to_solid(rib_center_lines_np, wing_mesh, plane_normal_np,
 
         print(f"Plane {i}: clipped surface created ({len(rib_mesh.vertices)} verts)")
 
-    print(f"Total clipped surfaces created: {len(clipped)}")
-
     # ----------------------------------------------------------------------
     # Visualise
     # ----------------------------------------------------------------------
