@@ -23,7 +23,8 @@ from solidify_utils import solidify_rib_line, tree_union
 def create_bridges_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
                                z_vals, bridge_height, margin=0.0,
                                doc=None, vis=False,
-                               thickness=None, boolean_engine='manifold'):
+                               thickness=None, boolean_engine='manifold',
+                               over_extrude=0.02):
     """
     Returns (bridge_mesh, bridge_solid):
         bridge_mesh  : the flat visualization ribbon (or None).
@@ -37,6 +38,11 @@ def create_bridges_analytical(rib_segment_meshes, bridge_segments, primary_dir_n
             f"length and correspond index-for-index."
         )
 
+    # bridge_width_interval needs a numeric thickness for its margin term
+    # even when the caller didn't ask for a solid (thickness=None) --
+    # fall back to 0 so the margin behaves exactly as before in that case.
+    margin_thickness = thickness if thickness is not None else 0.0
+
     prim, u_ax, v_ax = basis_vectors(primary_dir_np)
 
     all_vertices = []
@@ -46,7 +52,7 @@ def create_bridges_analytical(rib_segment_meshes, bridge_segments, primary_dir_n
     solids = [] if thickness is not None else None
 
     def policy(piece):
-        return bridge_width_interval(piece, bridge_height, margin)
+        return bridge_width_interval(piece, bridge_height, margin, margin_thickness)
 
     for seg_mesh, seg in zip(rib_segment_meshes, bridge_segments):
         ribbons = []
@@ -75,8 +81,9 @@ def create_bridges_analytical(rib_segment_meshes, bridge_segments, primary_dir_n
             intervals, frame = collect_line_intervals(seg_mesh, seg, prim, u_ax, v_ax, z_vals, policy)
             if intervals and frame is not None:
                 solid = solidify_rib_line(
-                    intervals, frame['plane_offset'], frame['prim'],
-                    frame['line_dir_3d'], frame['slab_normal'], thickness
+                    intervals, frame['origin_const'], frame['axis_d'],
+                    frame['line_dir_3d'], frame['slab_normal'], thickness,
+                    over_extrude=over_extrude
                 )
                 if solid is not None:
                     solids.append(solid)

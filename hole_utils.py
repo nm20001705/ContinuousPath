@@ -24,7 +24,8 @@ from solidify_utils import solidify_rib_line, tree_union
 def create_holes_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
                              z_vals, point_condition=None, hole_margin=0.0,
                              doc=None, vis=False,
-                             thickness=None, boolean_engine='manifold'):
+                             thickness=None, boolean_engine='manifold',
+                             over_extrude=0.02):
     """
     rib_segment_meshes / bridge_segments : see module docstring / earlier
         turns -- index i corresponds 1:1 (both from segment_bounds).
@@ -33,7 +34,10 @@ def create_holes_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
     thickness : float or None
         If given, also extrude each rib line's hole strip into a real
         volume (perpendicular to that rib's own plane) and union them
-        all into a single solid, returned as `hole_solid`.
+        all into a single solid, returned as `hole_solid`. Also used to
+        widen the effective hole_margin so the hole cutter stays clear
+        of the crossing rib's real extruded volume (see
+        rib_slice_core.hole_width_interval).
 
     Returns (hole_mesh, hole_solid):
         hole_mesh  : the flat visualization ribbon (or None).
@@ -50,6 +54,11 @@ def create_holes_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
             f"length and correspond index-for-index."
         )
 
+    # hole_width_interval needs a numeric thickness for its margin term
+    # even when the caller didn't ask for a solid (thickness=None) --
+    # fall back to 0 so the margin behaves exactly as before in that case.
+    margin_thickness = thickness if thickness is not None else 0.0
+
     prim, u_ax, v_ax = basis_vectors(primary_dir_np)
 
     all_vertices = []
@@ -59,7 +68,7 @@ def create_holes_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
     solids = [] if thickness is not None else None
 
     def policy(piece):
-        return hole_width_interval(piece, point_condition, hole_margin)
+        return hole_width_interval(piece, point_condition, hole_margin, margin_thickness)
 
     for seg_mesh, seg in zip(rib_segment_meshes, bridge_segments):
         ribbons = []
@@ -88,8 +97,9 @@ def create_holes_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
             intervals, frame = collect_line_intervals(seg_mesh, seg, prim, u_ax, v_ax, z_vals, policy)
             if intervals and frame is not None:
                 solid = solidify_rib_line(
-                    intervals, frame['plane_offset'], frame['prim'],
-                    frame['line_dir_3d'], frame['slab_normal'], thickness
+                    intervals, frame['origin_const'], frame['axis_d'],
+                    frame['line_dir_3d'], frame['slab_normal'], thickness,
+                    over_extrude=over_extrude
                 )
                 if solid is not None:
                     solids.append(solid)

@@ -24,6 +24,9 @@ from bridge_utils import create_bridges_analytical
 from hole_utils import create_holes_analytical
 from viz_utils import fit_view, show_rib_centre_lines
 
+from rib_solid_utils import build_rib_solid_analytical
+from assembly_utils_freecad import assemble_final_wing_freecad
+
 
 # ------------------------------------------------------------
 # Precompute wing cross‑sections for all Z‑slices
@@ -369,7 +372,8 @@ def main(params):
         margin=0.0,          # or params.bridge_margin if you want one
         doc=doc,
         vis=params.vis_bridge,
-        thickness=params.thickness
+        thickness=params.thickness, 
+        over_extrude=0.02
     )
 
     # ---- Create holes ----
@@ -388,7 +392,28 @@ def main(params):
         hole_margin=params.hole_margin,
         doc=doc,
         vis=params.vis_hole,
-        thickness=params.thickness
+        thickness=params.thickness, 
+        over_extrude=0.02
+    )
+
+    # ---- Build rib solid (real volume of the rib walls) ----
+    rib_solid = build_rib_solid_analytical(
+        rib_segments,
+        bridge_segments,
+        primary_dir_np,
+        thickness=params.thickness,
+        doc=doc,
+        vis=params.vis_rib_solid,
+    )
+
+    # ---- Final assembly: wing - (rib_solid - bridge_solid - hole_solid) ----
+    wing_obj = assemble_final_wing_freecad(
+        wing_shape,
+        rib_solid,
+        bridge_solid,
+        hole_solid,
+        doc=doc,
+        vis=params.vis_final,
     )
 
     # ---- Show centre lines if requested ----
@@ -442,7 +467,7 @@ if __name__ == "__main__":
         grid_orientation=0.0,
         primary_dir=FreeCAD.Vector(0, 0, 1),
         bridge_height=0.4,
-        hole_margin=0.5,
+        hole_margin=2,
         thickness=0.4,
         input_step_path="",
         vis_rib_centre_surfaces=False,
@@ -451,7 +476,9 @@ if __name__ == "__main__":
         vis_centre_lines=False,
         vis_bridge=True,
         vis_hole=True,
-        vis_wing=True,
+        vis_wing=False,
+        vis_rib_solid=True,
+        vis_final=False,
         z_step=0.2
     )
 

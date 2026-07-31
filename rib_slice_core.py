@@ -179,6 +179,9 @@ def iter_solid_pieces(seg_mesh, seg, prim, u_ax, v_ax, z_vals):
         P_uv = uv_of(P_3d, d, prim, u_ax, v_ax)
         t_rib = t_of(P_uv)
 
+        axis_d = dir_rib / denom
+        origin_const = p0 - (np.dot(prim, p0) / denom) * dir_rib
+
         groups = cluster_segments(pts_a_uv, pts_b_uv)
 
         t_min_solid = None
@@ -214,19 +217,31 @@ def iter_solid_pieces(seg_mesh, seg, prim, u_ax, v_ax, z_vals):
             'line_dir_3d': line_dir_3d,
             'slab_normal': slab_normal,
             'plane_offset': plane_offset,
+            'axis_d': axis_d,
+            'origin_const': origin_const
         }
 
 
-def hole_width_interval(piece, point_condition, hole_margin):
+def hole_width_interval(piece, point_condition, hole_margin, thickness):
     """Width policy for holes: point_condition(x) * available_width,
     centered in the piece, clamped to the margin-reduced interval.
-    Returns (t_start, t_end) or None."""
+
+    The margin at each end is (hole_margin + thickness/2) -- the extra
+    thickness/2 keeps the hole cutter clear of the *volume* the
+    neighboring crossing rib's solid actually occupies at the joint
+    (t_min_solid/t_max_solid only know about the flat, zero-thickness
+    cross-section, not the extruded solid), avoiding near-zero-thickness
+    webs that break the booleans.
+
+    Returns (t_start, t_end) or None.
+    """
     d = piece['d']
     d_min = piece['d_min']
     d_max = piece['d_max']
 
-    t_start = piece['t_min_solid'] + hole_margin
-    t_end = piece['t_max_solid'] - hole_margin
+    eff_margin = hole_margin + 0.5 * thickness
+    t_start = piece['t_min_solid'] + eff_margin
+    t_end = piece['t_max_solid'] - eff_margin
     if t_start >= t_end:
         return None
 
@@ -247,11 +262,15 @@ def hole_width_interval(piece, point_condition, hole_margin):
     return hs, he
 
 
-def bridge_width_interval(piece, bridge_height, margin):
+def bridge_width_interval(piece, bridge_height, margin, thickness):
     """Width policy for bridges: constant bridge_height, centered in the
-    piece. Returns None if it doesn't fit (no clamping)."""
-    t_start = piece['t_min_solid'] + margin
-    t_end = piece['t_max_solid'] - margin
+    piece. Same thickness-aware margin reasoning as hole_width_interval
+    -- bridges sit right at the rib crossing too, so they need the same
+    clearance from the neighboring rib's extruded volume.
+    Returns None if it doesn't fit (no clamping)."""
+    eff_margin = margin + 0.5 * thickness
+    t_start = piece['t_min_solid'] + eff_margin
+    t_end = piece['t_max_solid'] - eff_margin
     available_width = t_end - t_start
     if available_width < bridge_height:
         return None
@@ -262,7 +281,9 @@ def bridge_width_interval(piece, bridge_height, margin):
 def collect_line_intervals(seg_mesh, seg, prim, u_ax, v_ax, z_vals, width_policy_fn):
     """
     Runs iter_solid_pieces for one rib segment and applies width_policy_fn
-    to each slice. Returns (intervals, frame) where:
+    to each slice. width_policy_fn takes ONLY `piece` -- callers close
+    over thickness/margin/etc. themselves (see hole_utils.py /
+    bridge_utils.py). Returns (intervals, frame) where:
       intervals : list of (d0, d1, t_start, t_end) -- consecutive Z-steps
                   paired up, ready for solidify_rib_line. Note: this uses
                   the axis-aligned bounding rectangle of each pair's four
@@ -278,18 +299,27 @@ def collect_line_intervals(seg_mesh, seg, prim, u_ax, v_ax, z_vals, width_policy
     frame = None
 
     for piece in iter_solid_pieces(seg_mesh, seg, prim, u_ax, v_ax, z_vals):
-        result = width_policy_fn(piece)
-        if result is None:
-            continue
-        t_start, t_end = result
-        rows.append((piece['d'], t_start, t_end))
-        if frame is None:
-            frame = {
-                'plane_offset': piece['plane_offset'],
-                'prim': prim,
-                'line_dir_3d': piece['line_dir_3d'],
-                'slab_normal': piece['slab_normal'],
-            }
+            result = width_policy_fn(piece)
+            if result is None:
+                continue
+            t_start, t_end = result
+            t_rib = piece['t_rib']
+            # Store relative to this slice's centerline-crossing point.
+            # origin_const + d*axis_d already reconstructs P_3d(d) exactly
+            # (the point where the rib centerline crosses height d); the
+            # remaining in-wall offset is (t - t_rib(d)) along line_dir_3d,
+            # NOT t itself. t_rib(d) is generally nonzero and drifts with d,
+            # so using raw t here was adding a d-dependent shift to every
+            # strip -- this is what was showing up as bridges/holes drifting
+            # away from their correct position as height increased.
+            rows.append((piece['d'], t_start - t_rib, t_end - t_rib))
+            if frame is None:
+                frame = {
+                    'origin_const': piece['origin_const'],
+                    'axis_d': piece['axis_d'],
+                    'line_dir_3d': piece['line_dir_3d'],
+                    'slab_normal': piece['slab_normal'],
+                }
 
     if len(rows) < 2:
         return [], frame
