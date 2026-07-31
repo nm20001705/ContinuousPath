@@ -19,6 +19,7 @@ from slab_utils import (
     create_angled_grid_lines,
     clip_surfaces_to_solid,
     build_rib_segments_analytical,
+    merge_rib_segments_by_line,
 )
 from bridge_utils import create_bridges_analytical
 from hole_utils import create_holes_analytical
@@ -26,7 +27,7 @@ from viz_utils import fit_view, show_rib_centre_lines
 
 from rib_solid_utils import build_rib_solid_analytical
 from assembly_utils_freecad import assemble_final_wing_freecad
-
+from rib_solid_utils import build_full_rib_solid
 import MeshPart
 
 def export_wing_stl(wing_obj, filepath, linear_deflection=0.05, angular_deflection=0.3):
@@ -380,10 +381,18 @@ def main(params):
             'slab_normal': ld['slab_normal'],
         })
 
+    # ---- Merge rib segments back into one mesh per rib line ----
+    # Bridges are built per full rib line rather than per rib segment so
+    # they run continuously through rib-rib intersections instead of
+    # restarting (and sometimes gapping) at every crossing.
+    line_meshes, line_bridge_segments = merge_rib_segments_by_line(
+        rib_segments, segment_bounds, lines_data
+    )
+
     # ---- Create bridges ----
     bridge_mesh, bridge_solid = create_bridges_analytical(
-        rib_segments,
-        bridge_segments,
+        line_meshes,
+        line_bridge_segments,
         primary_dir_np,
         z_vals=z_vals,
         bridge_height=params.bridge_height,
@@ -415,11 +424,12 @@ def main(params):
     )
 
     # ---- Build rib solid (real volume of the rib walls) ----
-    rib_solid = build_rib_solid_analytical(
-        rib_segments,
-        bridge_segments,
-        primary_dir_np,
+    rib_solid = build_full_rib_solid(
+        all_lines_np,
+        plane_normal_np,
+        wing_mesh,
         thickness=params.thickness,
+        protrusion_margin=params.rib_protrusion_margin,
         doc=doc,
         vis=params.vis_rib_solid,
     )
@@ -480,19 +490,19 @@ if __name__ == "__main__":
     pdef = PLANE_DEFS[construction_plane]
 
     params = SimpleNamespace(
-        # doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wing.FCStd",
-        doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.FCStd",
-        # obj_name='WingR3_msv001_solid',
-        obj_name='WingR1_msv_orient001_solid',
-        # out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR3.stl",
-        out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR1.stl",
+        doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wing.FCStd",
+        # doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.FCStd",
+        obj_name='WingR3_msv001_solid',
+        # obj_name='WingR1_msv_orient001_solid',
+        out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR3.stl",
+        # out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR1.stl",
         rib_spacing=20.0,
         rib_angle=30.0,
         grid_orientation=0.0,
         primary_dir=FreeCAD.Vector(0, 0, 1),
         bridge_height=1,
         hole_margin=2,
-        thickness=1,
+        thickness=0.3,
         input_step_path="",
         vis_rib_centre_surfaces=False,
         vis_rib_centre_surfaces_clip=False,
@@ -503,7 +513,8 @@ if __name__ == "__main__":
         vis_wing=False,
         vis_rib_solid=True,
         vis_final=True,
-        z_step=1
+        z_step=1, 
+        rib_protrusion_margin = 2
     )
 
     params.plane_normal = pdef['normal']

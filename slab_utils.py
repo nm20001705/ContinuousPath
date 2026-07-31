@@ -642,3 +642,45 @@ def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
             print(f"Visualisation error: {e}")
 
     return all_segments, segment_bounds
+
+
+def merge_rib_segments_by_line(rib_segments, segment_bounds, lines_data):
+    """
+    Recombine the per-segment meshes from build_rib_segments_analytical
+    back into one mesh per original rib line (segments are only split at
+    rib-rib intersections; see the crossing_u logic above). Downstream
+    slicing (iter_solid_pieces, used by create_bridges_analytical) then
+    runs continuously across the full line instead of restarting at every
+    intersection -- restarting is what was causing bridges to break right
+    at rib crossings, since each segment's own Z-range stops just short of
+    the shared boundary.
+
+    Returns
+    -------
+    line_meshes : list[trimesh.Trimesh]
+    line_segments : list[dict]
+        One {'p0','p1','dir','slab_normal'} bridge-segment dict per line,
+        index-aligned with line_meshes.
+    """
+    by_line = {}
+    for seg_mesh, (line_idx, s0, s1) in zip(rib_segments, segment_bounds):
+        by_line.setdefault(line_idx, []).append(seg_mesh)
+
+    line_meshes = []
+    line_segments = []
+    for line_idx, meshes in by_line.items():
+        ld = lines_data[line_idx]
+        if ld is None:
+            continue
+        merged = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+        merged.merge_vertices()
+        merged.fix_normals()
+        line_meshes.append(merged)
+        line_segments.append({
+            'p0': ld['point'],
+            'p1': ld['point'] + ld['dir'],
+            'dir': ld['dir'],
+            'slab_normal': ld['slab_normal'],
+        })
+
+    return line_meshes, line_segments
