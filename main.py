@@ -21,7 +21,7 @@ from slab_utils import (
     build_rib_segments_analytical,
 )
 from bridge_utils import create_bridges_analytical
-from hole_utils import create_holes
+from hole_utils import create_holes_analytical
 from viz_utils import fit_view, show_rib_centre_lines
 
 
@@ -37,7 +37,7 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
     v_ax = np.cross(prim, u_ax)
 
     z_vals = []
-    slices = []
+    slices = []          # list of lists: each element is a list of (poly, to_3d)
     num_steps = int((d_max - d_min) / z_step) + 1
     pbar = tqdm(total=num_steps, desc="Precomputing slices")
     d = d_min
@@ -81,6 +81,7 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
             continue
         polys = list(polygonize(merged))
         if not polys:
+            # Fallback: convex hull of all endpoints
             all_pts = []
             for line in segments_2d:
                 all_pts.extend(line.coords)
@@ -91,40 +92,42 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
                 continue
             try:
                 hull = ConvexHull(pts)
-                poly = ShapelyPolygon(pts[hull.vertices])
+                polys = [ShapelyPolygon(pts[hull.vertices])]
             except Exception:
                 d += z_step
                 pbar.update(1)
                 continue
-        else:
-            poly = max(polys, key=lambda p: p.area)
 
-        if poly.is_empty or poly.area < 1e-8:
-            d += z_step
-            pbar.update(1)
-            continue
-
+        # Build one to_3d matrix for this slice (shared by all polygons)
         to_3d = np.eye(4)
         to_3d[:3, 0] = u_ax
         to_3d[:3, 1] = v_ax
         to_3d[:3, 3] = origin
 
-        z_vals.append(d)
-        slices.append((poly, to_3d))
+        # Store all non‑empty polygons with the shared matrix
+        slice_polys = []
+        for poly in polys:
+            if poly.is_empty or poly.area < 1e-8:
+                continue
+            slice_polys.append(poly)
+
+        if slice_polys:          # only keep slices that actually contain something
+            z_vals.append(d)
+            slices.append((slice_polys, to_3d))
+
         d += z_step
         pbar.update(1)
 
     pbar.close()
     return np.array(z_vals), slices
 
-
 # ------------------------------------------------------------
 # Improved mesh repair (preserves intentional holes)
 # ------------------------------------------------------------
-def repair_mesh(mesh):
+def repair_mesh(mesh, max_hole=3.0):
     """
-    Minimal repair that fixes only very small defects while preserving
-    intentional holes (servo cutouts, lightening holes).
+    Minimal repair that fixes defects up to `max_hole` mm while preserving
+    large intentional holes (servo cutouts, lightening holes).
     """
     if mesh is None:
         return None
@@ -138,6 +141,7 @@ def repair_mesh(mesh):
     if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
         return None
 
+    # Clean up vertices and degenerate faces
     try:
         mesh.merge_vertices()
     except:
@@ -151,9 +155,9 @@ def repair_mesh(mesh):
     except:
         pass
 
-    # Fill only very small holes (≤0.1 mm) – won't close intentional cutouts
+    # Fill holes up to `max_hole` mm – close small defects but keep the servo hole
     try:
-        mesh = trimesh.repair.fill_holes(mesh, max_hole=0.1)
+        mesh = trimesh.repair.fill_holes(mesh, max_hole=max_hole)
     except:
         pass
     try:
@@ -162,7 +166,6 @@ def repair_mesh(mesh):
         pass
 
     return mesh
-
 
 # ------------------------------------------------------------
 # Main function
@@ -188,10 +191,48 @@ def main(params):
     wing_mesh = shape_to_trimesh(wing_shape, deflection=0.5, angular=0.5)
     if wing_mesh is None:
         raise RuntimeError("Failed to convert wing to trimesh")
-    # Apply our improved repair
-    wing_mesh = repair_mesh(wing_mesh)
-    print(f"Wing bounds: {wing_mesh.bounds}")
-    print(f"Is watertight: {wing_mesh.is_watertight}, is volume: {wing_mesh.is_volume}")
+
+    # ---- Mesh diagnostics ----
+    print("=== Mesh diagnostics ===")
+    print(f"Vertices: {len(wing_mesh.vertices)}")
+    print(f"Faces: {len(wing_mesh.faces)}")
+    print(f"Watertight: {wing_mesh.is_watertight}")
+    print(f"Volume: {wing_mesh.is_volume}")
+
+    # Number of disconnected pieces
+    try:
+        pieces = wing_mesh.split()
+        if isinstance(pieces, list):
+            print(f"Disconnected components: {len(pieces)}")
+        else:
+            print("Disconnected components: 1 (no split)")
+    except Exception as e:
+        print(f"Could not split mesh: {e}")
+
+    print(f"Bounds: {wing_mesh.bounds}")
+
+    # Non‑manifold edges (edges shared by ≠2 faces)
+    try:
+        edges_sorted = wing_mesh.edges_sorted
+        unique_edges, counts = np.unique(edges_sorted, return_counts=True, axis=0)
+        bad_edges = unique_edges[counts != 2]
+        print(f"Non‑manifold edges: {len(bad_edges)}")
+    except Exception as e:
+        print(f"Could not count non‑manifold edges: {e}")
+
+    # Face area statistics
+    try:
+        areas = wing_mesh.area_faces
+        print(f"Face area range: {areas.min():.6f} to {areas.max():.3f}")
+    except Exception as e:
+        print(f"Could not compute face areas: {e}")
+
+    # Boundary edges
+    try:
+        boundary_edges = wing_mesh.edges[wing_mesh.edges_unique, :]
+        print(f"Boundary edges: {len(boundary_edges)}")
+    except Exception as e:
+        print(f"Could not compute boundary edges: {e}")
 
     # ---- Plane vectors (used everywhere) ----
     plane_normal_np = np.array([params.plane_normal.x, params.plane_normal.y, params.plane_normal.z])
@@ -335,17 +376,18 @@ def main(params):
     def hole_condition(x):
         return np.sqrt(max(0, 1 - (2 * x - 1) ** 2))
 
-    hole_mesh = create_holes(
-        wing_mesh,
-        bridge_segments,
+    # def hole_condition(x):
+    #     return 1
+
+    hole_mesh = create_holes_analytical(
+        rib_segments,          # <-- the trimesh list from build_rib_segments_analytical
+        bridge_segments,       # <-- unchanged, same list you already build
         primary_dir_np,
-        z_step=params.z_step,
-        point_condition=hole_condition,
         z_vals=z_vals,
-        slices=slices,
+        point_condition=hole_condition,
+        hole_margin=params.hole_margin,
         doc=doc,
         vis=params.vis_hole,
-        hole_margin=params.hole_margin,
     )
 
     # ---- Show centre lines if requested ----

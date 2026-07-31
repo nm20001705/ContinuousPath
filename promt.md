@@ -78,9 +78,130 @@ def create_holes_analytical(point_condition:type funciton)
                 slice = slice_slice_wing_at(z)
                 rib_intersection = get_rib_intersection_in_z(z, ribsurface, slice)
                 start_point, end_point = get_start_and_endpoint_of_line_segemnt(rib_intersection)
+                # start and end-points are the boundary of the wing section. This means everythin between those two points is inside the wing. 
+                # the condition can only produce points within this linesegement -> so each hole needs to be within the wing, there is no alternative.
                 center_point = get_center_from_two_points(strt_point, end_point, end_point, hole_marging )
                 point1, point2 = make_points_from_condition(point_condition, rib_intersection, start_point, center_point, hole_height_in_z)
                 points_for_bridge.append([p1, p2])
+            
+        bridge = make bridge_mesh_from_points(points_for_bridge)
+        bridges.append(bridge)
+
+
+def make_points_from_condition(point_condition, rib_intersection, start_point, center_point, rib_height_in_z, hole_marging, hole_height_in_z):
+    distance_between_start_end = get_dist(start_point, center_point) - 2 * hole_marging
+    if distance_between_start_end < 0:
+        distance_between_start_end = 0
+    x = (rib_height_in_z-hole_marging) / hole_height_in_z # this is a relative measure between 0 and 1 on how far we are in the rib slicing
+    dist_relative = point_condition(x=x)
+    point1 = center_point + (distance_between_start_end/2)*dist_relative
+    point2 = center_point - (distance_between_start_end/2)*dist_relative
+    return point1, point2
+
+def point_condition(x):
+    """x and y must be numbers between 0 and 1"""
+    y = 0.5
+    return y
+
+
+
+
+def create_bridges_analytical()
+    bridges = []
+    for rib in ribs:
+        points_for_bridge = []
+        rib_surface = build_analytical_ribsurface_equation
+        z_min, z_max = get_bound(rib) # the distance only in the z direction
+        for z in range(z_min, z_max, dz):
+            slice = slice_slice_wing_at(z)
+            rib_intersection = get_rib_intersection_in_z(z, ribsurface, slice)
+            start_point, end_point = get_start_and_endpoint_of_line_segemnt(rib_intersection) # here you did not understand
+            center_point = get_center_from_two_points(strt_point, end_point)
+            point1 = offset_point_on_line(centerpoint, rib_intersection, 0.5*rib_height)
+            point2 = offset_point_on_line(centerpoint, rib_intersection, -0.5*rib_height)
+            points_for_bridge.append([p1, p2])
+        bridge = make bridge_mesh_from_points(points_for_bridge)
+        bridges.append(bridge)
+
+
+
+def create_holes_analytical(point_condition:type funciton)
+    bridges = []
+    for rib_part in rib_parts:
+        points_for_bridge = []
+        rib_surface = build_analytical_ribsurface_equation()
+        z_min, z_max = get_bound(rib_part)
+        rib_height_in_z = z_max - z_min
+        hole_height_in_z = z_max - z_min - 2 * hole_marging
+        for z in range(z_min, z_max, dz):
+            if z > hole_marging and z < (rib_height_in_z-hole_margin):
+                slice = slice_slice_wing_at(z)
+                rib_intersections = get_rib_intersection_in_z(z, ribsurface, slice)
+                for rib_intersection in rib_intersections:
+                    if rib_intersection is_within_wing
+                        start_point, end_point = get_start_and_endpoint_of_line_segemnt(rib_intersection)
+                        # start and end-points are the boundary of the wing section. This means everythin between those two points is inside the wing. 
+                        # the condition can only produce points within this linesegement -> so each hole needs to be within the wing, there is no alternative.
+                        center_point = get_center_from_two_points(strt_point, end_point, end_point, hole_marging )
+                        point1, point2 = make_points_from_condition(point_condition, rib_intersection, start_point, center_point, hole_height_in_z)
+                        points_for_bridge.append([p1, p2])
+            
+        bridge = make bridge_mesh_from_points(points_for_bridge)
+        bridges.append(bridge)
+
+
+def make_points_from_condition(point_condition, rib_intersection, start_point, center_point, rib_height_in_z, hole_marging, hole_height_in_z):
+    distance_between_start_end = get_dist(start_point, center_point) - 2 * hole_marging
+    if distance_between_start_end < 0:
+        distance_between_start_end = 0
+    x = (rib_height_in_z-hole_marging) / hole_height_in_z # this is a relative measure between 0 and 1 on how far we are in the rib slicing
+    dist_relative = point_condition(x=x)
+    point1 = center_point + (distance_between_start_end/2)*dist_relative
+    point2 = center_point - (distance_between_start_end/2)*dist_relative
+    return point1, point2
+
+def point_condition(x):
+    """x and y must be numbers between 0 and 1"""
+    y = 0.5
+    return y
+
+
+
+# new approach.
+
+rib_segments, segment_bounds = build_rib_segments_analytical(
+    wing_mesh,
+    all_lines_np,
+    plane_normal_np,
+    doc=doc,
+    vis=params.vis_rib_segments,
+)
+
+def create_holes_analytical(point_condition:type funciton, rib_sections, hole_marging)
+    holes = []
+    rib_segments, segment_bounds = build_rib_segments_analytical(
+        wing_mesh,
+        all_lines_np,
+        plane_normal_np,
+        doc=doc,
+        vis=params.vis_rib_segments,
+    )
+    for rib_segemnt in rib_segments:
+        points_for_bridge = []
+        z_min, z_max = get_bound(rib_segemnt)
+        rib_height_in_z = z_max - z_min
+        hole_height_in_z = z_max - z_min - 2 * hole_marging
+        for z in range(z_min, z_max, dz):
+            if z > hole_marging and z < (rib_height_in_z-hole_margin):
+                slice = slice_slice_wing_at(z)
+                rib_intersections = get_rib_intersection_in_z(z, rib_segemnt, slice) -> if we slice now an actual surface (rib_segments, that are already entierly within the wing) in z we get only linesegements that are within the wing!
+                for rib_intersection in rib_intersections:
+                    start_point, end_point = get_start_and_endpoint_of_line_segemnt(rib_intersection)
+                    # start and end-points are the boundary of the wing section. This means everythin between those two points is inside the wing. 
+                    # the condition can only produce points within this linesegement -> so each hole needs to be within the wing, there is no alternative.
+                    center_point = get_center_from_two_points(strt_point, end_point, end_point, hole_marging )
+                    point1, point2 = make_points_from_condition(point_condition, rib_intersection, start_point, center_point, hole_height_in_z)
+                    points_for_bridge.append([p1, p2])
             
         bridge = make bridge_mesh_from_points(points_for_bridge)
         bridges.append(bridge)

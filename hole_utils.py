@@ -1,28 +1,53 @@
-# hole_utils.py
+# hole_utils.py – analytical version using rib_segment meshes directly
+#
+# Instead of intersecting the FULL wing slice polygon (which can contain
+# internal holes -> polygon-with-holes headaches), we slice each rib
+# segment mesh directly. A rib segment is already a solid chunk of the
+# wing (the result of a boolean intersection), so any horizontal slice of
+# it is guaranteed to be material only.
+#
+# KNOWN SIMPLIFICATION (intentional, per current spec):
+# If a rib segment slice produces multiple disjoint line pieces (e.g. the
+# cell straddles a servo-hole void), we do NOT yet try to figure out which
+# piece contains the rib centerline. We just pool every point from every
+# piece and take the two most extreme points along the bridge direction.
+# This is wrong in the presence of voids, but is deferred on purpose.
 
-import FreeCAD
-import Part
-import Mesh
-import MeshPart
 import numpy as np
 import trimesh
-from shapely.geometry import Polygon as ShapelyPolygon, LineString
-import trimesh.path.polygons
-from shapely.geometry import Polygon as ShapelyPolygon, LineString, Point
 from viz_utils import show_mesh
 from slab_utils import trimesh_to_freecad
-from shapely.ops import linemerge, polygonize
-from scipy.spatial import ConvexHull
 
-def create_holes(wing_mesh, rib_segments, primary_dir_np,
-                 z_step=0.2, point_condition=None, hole_margin=0.0,
-                 z_vals=None, slices=None,
-                 doc=None, vis=False):
+
+def create_holes_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
+                             z_vals, point_condition=None, hole_margin=0.0,
+                             doc=None, vis=False):
+    """
+    rib_segment_meshes : list[trimesh.Trimesh]
+        The solid rib cell pieces from build_rib_segments_analytical().
+    bridge_segments : list[dict]
+        Same length / same order as rib_segment_meshes. Each dict has
+        'p0', 'p1', 'dir', 'slab_normal' (as built in main.py from
+        segment_bounds). The i-th bridge_segment corresponds to the i-th
+        rib_segment_meshes entry because both come from the same
+        segment_bounds list, in the same order.
+    z_vals : np.ndarray
+        Global precomputed Z-slice positions (used only to keep slice
+        spacing consistent with the rest of the pipeline).
+    """
     if point_condition is None:
-        point_condition = lambda x: 0.0
+        point_condition = lambda x: 1.0
+
+    if len(rib_segment_meshes) != len(bridge_segments):
+        raise ValueError(
+            f"rib_segment_meshes ({len(rib_segment_meshes)}) and "
+            f"bridge_segments ({len(bridge_segments)}) must be the same "
+            f"length and correspond index-for-index."
+        )
 
     prim = primary_dir_np / np.linalg.norm(primary_dir_np)
 
+    # Same global basis used everywhere else in the pipeline
     if abs(prim[0]) > 0.9:
         u_ax = np.cross(prim, [0, 1, 0])
     else:
@@ -34,134 +59,121 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
     all_faces = []
     vert_offset = 0
 
-    for seg in rib_segments:
+    for seg_mesh, seg in zip(rib_segment_meshes, bridge_segments):
+        if seg_mesh is None or len(seg_mesh.vertices) == 0:
+            continue
+
         p0 = seg['p0']
-        p1 = seg['p1']
         dir_rib = seg['dir']
         slab_normal = seg['slab_normal']
 
-        d0 = np.dot(p0, prim)
-        d1 = np.dot(p1, prim)
-        d_min = min(d0, d1)
-        d_max = max(d0, d1)
-
-        d_start = d_min + hole_margin
-        d_end   = d_max - hole_margin
-        if d_start >= d_end:
-            continue
-        segment_z_span = d_end - d_start
-
+        # Bridge direction (perpendicular to rib centerline, in-slice)
         line_dir_3d = np.cross(slab_normal, prim)
         norm_l = np.linalg.norm(line_dir_3d)
         if norm_l < 1e-8:
             continue
         line_dir_3d /= norm_l
-        bridge_dir_2d = np.array([np.dot(line_dir_3d, u_ax), np.dot(line_dir_3d, v_ax)])
-        bridge_dir_2d /= np.linalg.norm(bridge_dir_2d)
+        bridge_dir_2d = np.array([np.dot(line_dir_3d, u_ax),
+                                   np.dot(line_dir_3d, v_ax)])
+        bd_norm = np.linalg.norm(bridge_dir_2d)
+        if bd_norm < 1e-8:
+            continue
+        bridge_dir_2d /= bd_norm
 
-        ribbon_pts = []
+        def uv_of(pt3d, d):
+            delta = pt3d - d * prim
+            return np.array([np.dot(delta, u_ax), np.dot(delta, v_ax)])
 
-        start_idx = np.searchsorted(z_vals, d_start)
-        end_idx = np.searchsorted(z_vals, d_end, side='right')
+        def t_of(uv):
+            return np.dot(uv, bridge_dir_2d)
+
+        # Z-range of this specific rib segment mesh (projected onto prim)
+        proj = seg_mesh.vertices @ prim
+        d_min = proj.min()
+        d_max = proj.max()
+        if d_max - d_min < 1e-8:
+            continue
+
+        start_idx = np.searchsorted(z_vals, d_min)
+        end_idx = np.searchsorted(z_vals, d_max, side='right')
+
+        ribbons = []  # (d, left_pt3d, right_pt3d)
 
         for idx in range(start_idx, end_idx):
             d = z_vals[idx]
-            wing_poly, to_3d_mat = slices[idx]
+            plane_origin = d * prim
 
+            try:
+                result = trimesh.intersections.mesh_plane(
+                    seg_mesh, plane_normal=prim, plane_origin=plane_origin
+                )
+            except Exception:
+                continue
+
+            lines = result[0] if isinstance(result, tuple) else result
+            if lines is None or len(lines) == 0:
+                continue
+
+            pts3d = np.asarray(lines).reshape(-1, 3)
+            if len(pts3d) < 2:
+                continue
+
+            # Project every point from every piece into (u,v) -> t
+            uvs = np.array([uv_of(p, d) for p in pts3d])
+            ts = np.array([t_of(uv) for uv in uvs])
+
+            # --- simplification: just take the two most outer points ---
+            t_min_solid = ts.min()
+            t_max_solid = ts.max()
+
+            # Rib centerline position on this plane, used as the
+            # reference origin for reconstructing points on the
+            # straight bridge line.
             denom = np.dot(prim, dir_rib)
             if abs(denom) < 1e-8:
                 continue
-            t_plane = np.dot(prim, d * prim - p0) / denom
+            t_plane = np.dot(prim, plane_origin - p0) / denom
             P_3d = p0 + t_plane * dir_rib
+            P_uv = uv_of(P_3d, d)
+            t_rib = t_of(P_uv)
 
-            P_uv = np.array([np.dot(P_3d - d * prim, u_ax),
-                             np.dot(P_3d - d * prim, v_ax)])
-
-            wing_uv = ShapelyPolygon(np.array(wing_poly.exterior.coords))
-
-            extent = 1e5
-            line = LineString([P_uv - extent * bridge_dir_2d, P_uv + extent * bridge_dir_2d])
-            try:
-                chord = wing_uv.intersection(line)
-            except Exception:
-                continue
-            if chord.is_empty:
+            # Apply margin
+            t_start = t_min_solid + hole_margin
+            t_end = t_max_solid - hole_margin
+            if t_start >= t_end:
                 continue
 
-            if chord.geom_type == 'MultiLineString':
-                best_seg = None
-                min_dist = np.inf
-                for sub in chord.geoms:
-                    dist = sub.distance(Point(P_uv))
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_seg = sub
-                chord = best_seg
-            if chord is None or chord.is_empty:
-                continue
+            t_center = (t_start + t_end) / 2.0
+            available_width = t_end - t_start
 
-            coords = np.array(chord.coords)
-            if len(coords) < 2:
-                continue
-
-            # ---- Guard 1: minimum chord length ----
-            chord_len = np.linalg.norm(coords[-1] - coords[0])
-            if chord_len < 0.1:
-                continue
-
-            # ---- Guard 2: wing polygon must be valid ----
-            if not wing_uv.is_valid:
-                continue
-
-            midpoint_uv = (coords[0] + coords[-1]) / 2.0
-
-            # ---- Guard 3: midpoint inside wing ----
-            if not wing_uv.buffer(1e-6).contains(Point(midpoint_uv)):
-                skipped_midpoint += 1
-                continue
-
-            t_vals = np.dot(coords, bridge_dir_2d)
-            t_min, t_max = t_vals.min(), t_vals.max()
-
-            t_min_safe = t_min + hole_margin
-            t_max_safe = t_max - hole_margin
-            if t_min_safe >= t_max_safe:
-                continue
-
-            t_center = np.dot(midpoint_uv, bridge_dir_2d)
-            chord_half_effective = (t_max_safe - t_min_safe) / 2.0
-
-            if segment_z_span > 1e-8:
-                x = (d - d_start) / segment_z_span
-            else:
-                x = 0.0
+            x = (d - d_min) / (d_max - d_min)
             factor = point_condition(x)
-            half_w = factor * chord_half_effective
 
-            t_start = max(t_center - half_w, t_min_safe)
-            t_end   = min(t_center + half_w, t_max_safe)
-
-            # ---- Guard 4: segment width non-zero ----
-            if t_end - t_start < 1e-6:
+            half_w = factor * available_width / 2.0
+            if half_w < 1e-6:
                 continue
 
-            seg_start_uv = midpoint_uv + (t_start - t_center) * bridge_dir_2d
-            seg_end_uv   = midpoint_uv + (t_end   - t_center) * bridge_dir_2d
+            hole_start = max(t_center - half_w, t_start)
+            hole_end = min(t_center + half_w, t_end)
+            if hole_end - hole_start < 1e-6:
+                continue
+
+            def t_to_uv(t):
+                return P_uv + (t - t_rib) * bridge_dir_2d
 
             def uv_to_3d(uv):
-                pt = np.array([uv[0], uv[1], 0.0, 1.0])
-                pt3d = to_3d_mat @ pt
-                return pt3d[:3]
+                return plane_origin + uv[0] * u_ax + uv[1] * v_ax
 
-            pt_left  = uv_to_3d(seg_start_uv)
-            pt_right = uv_to_3d(seg_end_uv)
-            ribbon_pts.append((d, pt_left, pt_right))
+            pt_left = uv_to_3d(t_to_uv(hole_start))
+            pt_right = uv_to_3d(t_to_uv(hole_end))
 
-        if len(ribbon_pts) >= 2:
-            ribbon_pts.sort(key=lambda x: x[0])
-            for k in range(len(ribbon_pts) - 1):
-                _, L1, R1 = ribbon_pts[k]
-                _, L2, R2 = ribbon_pts[k+1]
+            ribbons.append((d, pt_left, pt_right))
+
+        if len(ribbons) >= 2:
+            ribbons.sort(key=lambda x: x[0])
+            for k in range(len(ribbons) - 1):
+                _, L1, R1 = ribbons[k]
+                _, L2, R2 = ribbons[k + 1]
                 v0 = vert_offset
                 v1 = vert_offset + 1
                 v2 = vert_offset + 2
@@ -181,7 +193,7 @@ def create_holes(wing_mesh, rib_segments, primary_dir_np,
     hole_mesh.merge_vertices()
     hole_mesh.fix_normals()
 
-    print(f"Hole mesh: {len(hole_mesh.vertices)} verts, {len(hole_mesh.faces)} faces")
+    print(f"Hole mesh (analytical): {len(hole_mesh.vertices)} verts, {len(hole_mesh.faces)} faces")
 
     if vis and doc:
         try:
