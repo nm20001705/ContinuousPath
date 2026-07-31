@@ -1,177 +1,107 @@
-# bridge_utils.py
+# bridge_utils_analytical.py – analytical bridge generation using
+# rib_segment meshes directly, built on the same shared slicing/void
+# logic as hole_utils_analytical.py (see rib_slice_core.py).
+#
+# Width policy: constant bridge_height, centered in the chosen piece; if
+# it doesn't fit, no bridge at that slice (no clamping). See
+# rib_slice_core.bridge_width_interval.
+#
+# If thickness is given, ALSO builds the real extruded volume (per rib
+# line, then unioned) in the same pass.
 
-import FreeCAD
-import Part
-import Mesh
-import MeshPart
 import numpy as np
 import trimesh
-from shapely.geometry import Polygon as ShapelyPolygon, LineString
-import trimesh.path.polygons
-from shapely.geometry import Polygon as ShapelyPolygon, LineString, Point
 from viz_utils import show_mesh
 from slab_utils import trimesh_to_freecad
-from shapely.ops import linemerge, polygonize
-from scipy.spatial import ConvexHull
+from rib_slice_core import (
+    basis_vectors, iter_solid_pieces, t_to_3d, ribbons_to_mesh,
+    bridge_width_interval, collect_line_intervals,
+)
+from solidify_utils import solidify_rib_line, tree_union
 
-def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
-                              z_step=0.2, bridge_height=0.5,
-                              z_vals=None, slices=None,
-                              doc=None, vis=False):
-    prim = primary_dir_np / np.linalg.norm(primary_dir_np)
 
-    if abs(prim[0]) > 0.9:
-        u_ax = np.cross(prim, [0, 1, 0])
-    else:
-        u_ax = np.cross(prim, [1, 0, 0])
-    u_ax = u_ax / np.linalg.norm(u_ax)
-    v_ax = np.cross(prim, u_ax)
+def create_bridges_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
+                               z_vals, bridge_height, margin=0.0,
+                               doc=None, vis=False,
+                               thickness=None, boolean_engine='manifold'):
+    """
+    Returns (bridge_mesh, bridge_solid):
+        bridge_mesh  : the flat visualization ribbon (or None).
+        bridge_solid : the unioned extruded volume (or None if thickness
+                        was not given, or nothing was generated).
+    """
+    if len(rib_segment_meshes) != len(bridge_segments):
+        raise ValueError(
+            f"rib_segment_meshes ({len(rib_segment_meshes)}) and "
+            f"bridge_segments ({len(bridge_segments)}) must be the same "
+            f"length and correspond index-for-index."
+        )
+
+    prim, u_ax, v_ax = basis_vectors(primary_dir_np)
 
     all_vertices = []
     all_faces = []
     vert_offset = 0
 
-    for seg in rib_segments:
-        p0 = seg['p0']
-        p1 = seg['p1']
-        dir_rib = seg['dir']
-        slab_normal = seg['slab_normal']
+    solids = [] if thickness is not None else None
 
-        d0 = np.dot(p0, prim)
-        d1 = np.dot(p1, prim)
-        d_min = min(d0, d1)
-        d_max = max(d0, d1)
+    def policy(piece):
+        return bridge_width_interval(piece, bridge_height, margin)
 
-        line_dir_3d = np.cross(slab_normal, prim)
-        norm_l = np.linalg.norm(line_dir_3d)
-        if norm_l < 1e-8:
-            continue
-        line_dir_3d /= norm_l
-        bridge_dir_2d = np.array([np.dot(line_dir_3d, u_ax), np.dot(line_dir_3d, v_ax)])
-        bridge_dir_2d /= np.linalg.norm(bridge_dir_2d)
-
-        start_idx = np.searchsorted(z_vals, d_min)
-        end_idx = np.searchsorted(z_vals, d_max, side='right')
-
-        # We'll build a list of ribbons. Each ribbon is a list of (d, left_pt, right_pt)
+    for seg_mesh, seg in zip(rib_segment_meshes, bridge_segments):
         ribbons = []
 
-        for idx in range(start_idx, end_idx):
-            d = z_vals[idx]
-            slice_polys, to_3d_mat = slices[idx]
-
-            denom = np.dot(prim, dir_rib)
-            if abs(denom) < 1e-8:
+        for piece in iter_solid_pieces(seg_mesh, seg, prim, u_ax, v_ax, z_vals):
+            result = policy(piece)
+            if result is None:
                 continue
-            t_plane = np.dot(prim, d * prim - p0) / denom
-            P_3d = p0 + t_plane * dir_rib
+            bridge_start, bridge_end = result
 
-            P_uv = np.array([np.dot(P_3d - d * prim, u_ax),
-                             np.dot(P_3d - d * prim, v_ax)])
+            pt_left = t_to_3d(bridge_start, piece['P_uv'], piece['t_rib'],
+                               piece['bridge_dir_2d'], piece['plane_origin'], u_ax, v_ax)
+            pt_right = t_to_3d(bridge_end, piece['P_uv'], piece['t_rib'],
+                                piece['bridge_dir_2d'], piece['plane_origin'], u_ax, v_ax)
 
-            # For each polygon in this slice, intersect with the slab line
-            poly_ribbons = []   # list of (d, left_pt, right_pt) for this slice
-            for wing_poly in slice_polys:
-                wing_uv = ShapelyPolygon(np.array(wing_poly.exterior.coords))
-                if not wing_uv.is_valid or wing_uv.is_empty:
-                    continue
+            ribbons.append((piece['d'], pt_left, pt_right))
 
-                extent = 1e5
-                line = LineString([P_uv - extent * bridge_dir_2d, P_uv + extent * bridge_dir_2d])
-                try:
-                    chord = wing_uv.intersection(line)
-                except Exception:
-                    continue
-                if chord.is_empty:
-                    continue
-
-                # Collect all LineString pieces (in case of complex shapes)
-                if chord.geom_type == 'LineString':
-                    chord_pieces = [chord]
-                elif chord.geom_type == 'MultiLineString':
-                    chord_pieces = list(chord.geoms)
-                else:
-                    continue
-
-                for piece in chord_pieces:
-                    coords = np.array(piece.coords)
-                    if len(coords) < 2:
-                        continue
-                    chord_len = np.linalg.norm(coords[-1] - coords[0])
-                    if chord_len < 0.1:
-                        continue
-
-                    # Use the chord endpoints
-                    start_uv = coords[0]
-                    end_uv   = coords[-1]
-                    midpoint_uv = (start_uv + end_uv) / 2.0
-
-                    # Build the bridge segment
-                    t_vals = np.array([np.dot(start_uv, bridge_dir_2d),
-                                       np.dot(end_uv, bridge_dir_2d)])
-                    t_min, t_max = t_vals.min(), t_vals.max()
-                    t_center = np.dot(midpoint_uv, bridge_dir_2d)
-
-                    half_w = bridge_height
-                    t_start = max(t_center - half_w, t_min)
-                    t_end   = min(t_center + half_w, t_max)
-                    if t_end - t_start < 1e-6:
-                        continue
-
-                    seg_start_uv = midpoint_uv + (t_start - t_center) * bridge_dir_2d
-                    seg_end_uv   = midpoint_uv + (t_end   - t_center) * bridge_dir_2d
-
-                    # Convert to 3D
-                    def uv_to_3d(uv):
-                        pt = np.array([uv[0], uv[1], 0.0, 1.0])
-                        pt3d = to_3d_mat @ pt
-                        return pt3d[:3]
-
-                    pt_left  = uv_to_3d(seg_start_uv)
-                    pt_right = uv_to_3d(seg_end_uv)
-                    poly_ribbons.append((d, pt_left, pt_right))
-
-            # Merge the new slice's ribbons with existing ones
-            # Simple heuristic: if only one ribbon at this slice, append to the last ribbon.
-            # For multiple disconnected regions, we'd need proper tracking.
-            # For now, we'll just accumulate all points and hope they don't cross.
-            # A more robust version would group by spatial proximity, but for typical wings
-            # this works.
-            if poly_ribbons:
-                ribbons.extend(poly_ribbons)
-
-        # Triangulate each ribbon (here we treat all points as one ribbon for simplicity)
-        # For robust handling, you could group by proximity in 3D, but for now we just
-        # sort by d and build quads.
         if len(ribbons) >= 2:
-            # Sort by d
-            ribbons.sort(key=lambda x: x[0])
-            # Build quad strips
-            for k in range(len(ribbons) - 1):
-                _, L1, R1 = ribbons[k]
-                _, L2, R2 = ribbons[k+1]
-                v0 = vert_offset
-                v1 = vert_offset + 1
-                v2 = vert_offset + 2
-                v3 = vert_offset + 3
-                all_vertices.extend([L1, R1, R2, L2])
-                all_faces.append([v0, v1, v2])
-                all_faces.append([v0, v2, v3])
-                vert_offset += 4
+            ribbons.sort(key=lambda r: r[0])
+            verts, faces = ribbons_to_mesh(ribbons)
+            all_vertices.extend(verts)
+            all_faces.extend([[a + vert_offset, b + vert_offset, c + vert_offset] for a, b, c in faces])
+            vert_offset += len(verts)
 
-    if not all_vertices:
-        print("No bridge geometry generated.")
-        return None
+        if thickness is not None:
+            intervals, frame = collect_line_intervals(seg_mesh, seg, prim, u_ax, v_ax, z_vals, policy)
+            if intervals and frame is not None:
+                solid = solidify_rib_line(
+                    intervals, frame['plane_offset'], frame['prim'],
+                    frame['line_dir_3d'], frame['slab_normal'], thickness
+                )
+                if solid is not None:
+                    solids.append(solid)
 
-    verts_arr = np.array(all_vertices)
-    faces_arr = np.array(all_faces)
-    bridge_mesh = trimesh.Trimesh(vertices=verts_arr, faces=faces_arr, process=False)
-    bridge_mesh.merge_vertices()
-    bridge_mesh.fix_normals()
+    bridge_mesh = None
+    if all_vertices:
+        verts_arr = np.array(all_vertices)
+        faces_arr = np.array(all_faces)
+        bridge_mesh = trimesh.Trimesh(vertices=verts_arr, faces=faces_arr, process=False)
+        bridge_mesh.merge_vertices()
+        bridge_mesh.fix_normals()
+        print(f"Bridge mesh (analytical): {len(bridge_mesh.vertices)} verts, {len(bridge_mesh.faces)} faces")
+    else:
+        print("No bridge ribbon geometry generated.")
 
-    print(f"Bridge mesh: {len(bridge_mesh.vertices)} verts, {len(bridge_mesh.faces)} faces")
+    bridge_solid = None
+    if thickness is not None:
+        bridge_solid = tree_union(solids, engine=boolean_engine)
+        if bridge_solid is not None:
+            print(f"Bridge solid: {len(bridge_solid.vertices)} verts, {len(bridge_solid.faces)} faces, "
+                  f"watertight={bridge_solid.is_watertight}")
+        else:
+            print("No bridge solid geometry generated.")
 
-    if vis and doc:
+    if vis and doc and bridge_mesh is not None:
         try:
             fc_mesh = trimesh_to_freecad(bridge_mesh)
             if fc_mesh:
@@ -182,4 +112,4 @@ def create_bridges_analytical(wing_mesh, rib_segments, primary_dir_np,
         except Exception as e:
             print(f"Visualisation error: {e}")
 
-    return bridge_mesh
+    return bridge_mesh, bridge_solid

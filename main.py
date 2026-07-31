@@ -360,16 +360,16 @@ def main(params):
         })
 
     # ---- Create bridges ----
-    bridge_mesh = create_bridges_analytical(
-        wing_mesh,
+    bridge_mesh, bridge_solid = create_bridges_analytical(
+        rib_segments,
         bridge_segments,
         primary_dir_np,
-        z_step=params.z_step,
-        bridge_height=params.bridge_height,
         z_vals=z_vals,
-        slices=slices,
+        bridge_height=params.bridge_height,
+        margin=0.0,          # or params.bridge_margin if you want one
         doc=doc,
         vis=params.vis_bridge,
+        thickness=params.thickness
     )
 
     # ---- Create holes ----
@@ -379,7 +379,7 @@ def main(params):
     # def hole_condition(x):
     #     return 1
 
-    hole_mesh = create_holes_analytical(
+    hole_mesh, hole_solid = create_holes_analytical(
         rib_segments,          # <-- the trimesh list from build_rib_segments_analytical
         bridge_segments,       # <-- unchanged, same list you already build
         primary_dir_np,
@@ -388,6 +388,7 @@ def main(params):
         hole_margin=params.hole_margin,
         doc=doc,
         vis=params.vis_hole,
+        thickness=params.thickness
     )
 
     # ---- Show centre lines if requested ----
@@ -442,6 +443,7 @@ if __name__ == "__main__":
         primary_dir=FreeCAD.Vector(0, 0, 1),
         bridge_height=0.4,
         hole_margin=0.5,
+        thickness=0.4,
         input_step_path="",
         vis_rib_centre_surfaces=False,
         vis_rib_centre_surfaces_clip=False,
