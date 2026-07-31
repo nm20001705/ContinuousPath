@@ -6,17 +6,65 @@
 # wing (the result of a boolean intersection), so any horizontal slice of
 # it is guaranteed to be material only.
 #
-# KNOWN SIMPLIFICATION (intentional, per current spec):
+# VOID HANDLING:
 # If a rib segment slice produces multiple disjoint line pieces (e.g. the
-# cell straddles a servo-hole void), we do NOT yet try to figure out which
-# piece contains the rib centerline. We just pool every point from every
-# piece and take the two most extreme points along the bridge direction.
-# This is wrong in the presence of voids, but is deferred on purpose.
+# cell straddles a servo-hole void), we cluster the raw mesh_plane edges
+# into connected pieces (by shared endpoints) and pick whichever piece is
+# CLOSEST to the rib centerline's projection (t_rib) -- distance 0 if
+# t_rib genuinely falls inside it. hole_margin is then applied to that
+# piece's own boundaries -- which may be the outer wing skin on one side
+# and the void wall on the other. This makes the hole shrink away from
+# the void by hole_margin automatically, with no special-casing needed:
+# a void boundary is just another edge.
+#
+# Nearest-piece (rather than strict containment) matters most near thin
+# sections (e.g. the trailing edge): t_rib comes from an idealized
+# infinite centerline, while piece bounds come from the triangulated
+# mesh, and once the solid strip gets thinner than that numerical noise,
+# strict containment spuriously rejects perfectly good slices. A slice is
+# only skipped now if mesh_plane returns literally nothing to cluster.
 
 import numpy as np
 import trimesh
 from viz_utils import show_mesh
 from slab_utils import trimesh_to_freecad
+
+
+def _cluster_segments(pts_a, pts_b, tol=5):
+    """
+    Group segment indices into connected components based on shared
+    endpoints. pts_a/pts_b are (N,2) arrays of uv endpoints for N segments.
+    Returns a list of index-arrays, one per connected piece.
+    """
+    n = len(pts_a)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    key_map = {}
+    for idx in range(n):
+        for endpoint in (pts_a[idx], pts_b[idx]):
+            key = (round(float(endpoint[0]), tol), round(float(endpoint[1]), tol))
+            if key in key_map:
+                union(idx, key_map[key])
+            else:
+                key_map[key] = idx
+
+    groups = {}
+    for idx in range(n):
+        r = find(idx)
+        groups.setdefault(r, []).append(idx)
+
+    return list(groups.values())
 
 
 def create_holes_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
@@ -114,21 +162,17 @@ def create_holes_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
             if lines is None or len(lines) == 0:
                 continue
 
-            pts3d = np.asarray(lines).reshape(-1, 3)
-            if len(pts3d) < 2:
+            lines_arr = np.asarray(lines)
+            if len(lines_arr) < 1:
                 continue
 
-            # Project every point from every piece into (u,v) -> t
-            uvs = np.array([uv_of(p, d) for p in pts3d])
-            ts = np.array([t_of(uv) for uv in uvs])
+            # uv endpoints of every raw segment returned by mesh_plane
+            pts_a_uv = np.array([uv_of(p, d) for p in lines_arr[:, 0, :]])
+            pts_b_uv = np.array([uv_of(p, d) for p in lines_arr[:, 1, :]])
 
-            # --- simplification: just take the two most outer points ---
-            t_min_solid = ts.min()
-            t_max_solid = ts.max()
-
-            # Rib centerline position on this plane, used as the
-            # reference origin for reconstructing points on the
-            # straight bridge line.
+            # Rib centerline position on this plane, used both to pick
+            # the correct piece and as the reference origin for
+            # reconstructing points on the straight bridge line.
             denom = np.dot(prim, dir_rib)
             if abs(denom) < 1e-8:
                 continue
@@ -136,6 +180,41 @@ def create_holes_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
             P_3d = p0 + t_plane * dir_rib
             P_uv = uv_of(P_3d, d)
             t_rib = t_of(P_uv)
+
+            # Cluster raw segments into connected pieces (handles voids:
+            # a piece boundary can be the outer skin OR a void wall).
+            groups = _cluster_segments(pts_a_uv, pts_b_uv)
+
+            # Pick the piece CLOSEST to t_rib rather than requiring strict
+            # containment. Near the trailing edge the solid strip can be
+            # thinner than the numerical noise in t_rib (which comes from
+            # an idealized infinite centerline, not the triangulated
+            # mesh), so a strict "t_rib must be inside" check spuriously
+            # rejects perfectly valid slices. Distance is 0 whenever t_rib
+            # genuinely falls inside a piece, so this is a strict superset
+            # of the old behavior for the common case, and only kicks in
+            # to rescue the near-miss / thin-strip case.
+            t_min_solid = None
+            t_max_solid = None
+            best_dist = None
+            for idxs in groups:
+                piece_pts_uv = np.concatenate(
+                    [pts_a_uv[idxs], pts_b_uv[idxs]], axis=0
+                )
+                piece_ts = np.array([t_of(uv) for uv in piece_pts_uv])
+                p_t_min, p_t_max = piece_ts.min(), piece_ts.max()
+                if t_rib < p_t_min:
+                    dist = p_t_min - t_rib
+                elif t_rib > p_t_max:
+                    dist = t_rib - p_t_max
+                else:
+                    dist = 0.0
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    t_min_solid, t_max_solid = p_t_min, p_t_max
+
+            if t_min_solid is None:
+                continue
 
             # Apply margin
             t_start = t_min_solid + hole_margin
