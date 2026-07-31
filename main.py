@@ -27,6 +27,24 @@ from viz_utils import fit_view, show_rib_centre_lines
 from rib_solid_utils import build_rib_solid_analytical
 from assembly_utils_freecad import assemble_final_wing_freecad
 
+import MeshPart
+
+def export_wing_stl(wing_obj, filepath, linear_deflection=0.05, angular_deflection=0.3):
+    """
+    Tessellate wing_obj (a Part.Shape) and write STL directly, with a
+    deflection tight enough to resolve thin features (bridge_height /
+    thickness scale, here 0.4mm) -- FreeCAD's default STL export
+    deflection can be coarse enough to merge/skip walls that thin.
+    """
+    mesh_obj = MeshPart.meshFromShape(
+        Shape=wing_obj,
+        LinearDeflection=linear_deflection,
+        AngularDeflection=angular_deflection,
+        Relative=False,
+    )
+    mesh_obj.write(filepath)
+    print(f"Exported STL: {filepath} ({len(mesh_obj.Points)} verts, "
+          f"{len(mesh_obj.Facets)} facets)")
 
 # ------------------------------------------------------------
 # Precompute wing cross‑sections for all Z‑slices
@@ -150,7 +168,7 @@ def repair_mesh(mesh, max_hole=3.0):
     except:
         pass
     try:
-        mesh.remove_degenerate_faces()
+        mesh.update_faces(mesh.nondegenerate_faces())
     except:
         pass
     try:
@@ -434,6 +452,8 @@ def main(params):
         except Exception as e:
             print(f"Wing mesh visualisation error: {e}")
 
+    if wing_obj is not None:
+        export_wing_stl(wing_obj, params.out_path, linear_deflection=0.05)
     # ---- Save ----
     doc.save()
     print("Document saved.")
@@ -460,15 +480,19 @@ if __name__ == "__main__":
     pdef = PLANE_DEFS[construction_plane]
 
     params = SimpleNamespace(
+        # doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wing.FCStd",
         doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.FCStd",
+        # obj_name='WingR3_msv001_solid',
         obj_name='WingR1_msv_orient001_solid',
+        # out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR3.stl",
+        out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR1.stl",
         rib_spacing=20.0,
         rib_angle=30.0,
         grid_orientation=0.0,
         primary_dir=FreeCAD.Vector(0, 0, 1),
-        bridge_height=0.4,
+        bridge_height=1,
         hole_margin=2,
-        thickness=0.4,
+        thickness=1,
         input_step_path="",
         vis_rib_centre_surfaces=False,
         vis_rib_centre_surfaces_clip=False,
@@ -478,8 +502,8 @@ if __name__ == "__main__":
         vis_hole=True,
         vis_wing=False,
         vis_rib_solid=True,
-        vis_final=False,
-        z_step=0.2
+        vis_final=True,
+        z_step=1
     )
 
     params.plane_normal = pdef['normal']

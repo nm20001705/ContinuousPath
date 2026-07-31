@@ -123,7 +123,7 @@ def repair_mesh(mesh):
     except:
         pass
     try:
-        mesh.remove_degenerate_faces()
+        mesh.update_faces(mesh.nondegenerate_faces())
     except:
         pass
     try:
@@ -556,8 +556,8 @@ def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
         polygons = planar.polygons_full
         if not polygons:
             continue
-        wing_poly = polygons[0]
-        if wing_poly.is_empty or wing_poly.area < 1e-8:
+        wing_poly = max(polygons, key=lambda p: p.area)
+        if wing_poly.is_empty or wing_poly.area < 1e-6:
             continue
 
         to_3d_mat = np.array(to_3d)   # (4,4)
@@ -619,8 +619,9 @@ def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
                 verts3d = (to_3d_mat @ verts_h.T).T[:, :3]
 
                 seg_mesh = trimesh.Trimesh(vertices=verts3d, faces=faces, process=False)
+                seg_mesh.merge_vertices()   # collapses the duplicate rim vertices
                 seg_mesh.fix_normals()
-                all_segments.append(seg_mesh)
+                all_segments.append(seg_mesh)   # <-- this line was missing
 
                 # ----- Record the segment bounds -----
                 segment_bounds.append((i, crossing_params[k], crossing_params[k+1]))

@@ -18,6 +18,7 @@
 import trimesh
 import Part
 from slab_utils import trimesh_to_freecad
+from mesh_simplify_utils import merge_coplanar_faces
 
 def simplify_for_conversion(tm, target_faces=20000):
     """
@@ -123,8 +124,25 @@ def assemble_final_wing_freecad(wing_shape, rib_solid_tm, bridge_solid_tm, hole_
     print(f"cut_solid (trimesh): {len(cut_solid_tm.vertices)} verts, "
           f"{len(cut_solid_tm.faces)} faces, watertight={cut_solid_tm.is_watertight}")
 
-    # ---- Step 2: simplify the single combined mesh ----
-    cut_solid_tm = simplify_for_conversion(cut_solid_tm, simplify_target_faces)
+    # ---- Step 2a: lossless redundancy removal (coplanar merge) ----
+    cut_solid_tm = merge_coplanar_faces(cut_solid_tm)
+    if not cut_solid_tm.is_watertight:
+        print("Warning: coplanar merge broke watertightness, this shouldn't "
+              "normally happen -- check min_group_size / tolerances.")
+
+    # ---- Step 2b: lossy simplification -- SKIP unless coplanar merge
+    # wasn't enough. Quadric decimation collapses small notches (like the
+    # bridge_height-scale cavities cut_solid has wherever a bridge/hole
+    # was subtracted) just as readily as real redundancy, since their
+    # geometric error is small relative to the whole mesh. That's what
+    # was silently erasing your bridges/holes from the exported STL. ----
+    print(f"cut_solid after coplanar merge: {len(cut_solid_tm.faces)} faces")
+    if len(cut_solid_tm.faces) > simplify_target_faces:
+        print("Still large after coplanar merge -- applying quadric decimation "
+              "(this CAN remove thin features; verify the exported STL carefully).")
+        cut_solid_tm = simplify_for_conversion(cut_solid_tm, simplify_target_faces)
+    else:
+        print("Skipping quadric decimation -- coplanar merge alone was sufficient.")
 
     # ---- Add the (simplified) cut_solid mesh to the project and save,
     # regardless of whether we go on to do the full wing cut. This is

@@ -221,25 +221,23 @@ def iter_solid_pieces(seg_mesh, seg, prim, u_ax, v_ax, z_vals):
             'origin_const': origin_const
         }
 
-
 def hole_width_interval(piece, point_condition, hole_margin, thickness):
-    """Width policy for holes: point_condition(x) * available_width,
-    centered in the piece, clamped to the margin-reduced interval.
-
-    The margin at each end is (hole_margin + thickness/2) -- the extra
-    thickness/2 keeps the hole cutter clear of the *volume* the
-    neighboring crossing rib's solid actually occupies at the joint
-    (t_min_solid/t_max_solid only know about the flat, zero-thickness
-    cross-section, not the extruded solid), avoiding near-zero-thickness
-    webs that break the booleans.
-
-    Returns (t_start, t_end) or None.
-    """
     d = piece['d']
     d_min = piece['d_min']
     d_max = piece['d_max']
 
     eff_margin = hole_margin + 0.5 * thickness
+
+    # d-direction margin: real clearance from THIS rib's own crossing
+    # surface at top/bottom, instead of relying on point_condition to
+    # taper to zero exactly at the raw geometric boundary.
+    d_start = d_min + eff_margin
+    d_end = d_max - eff_margin
+    if d_start >= d_end or d < d_start or d > d_end:
+        return None
+
+    # t-direction margin: same eff_margin, from the neighboring
+    # crossing rib's solid surface (unchanged from before).
     t_start = piece['t_min_solid'] + eff_margin
     t_end = piece['t_max_solid'] - eff_margin
     if t_start >= t_end:
@@ -248,7 +246,7 @@ def hole_width_interval(piece, point_condition, hole_margin, thickness):
     t_center = (t_start + t_end) / 2.0
     available_width = t_end - t_start
 
-    x = (d - d_min) / (d_max - d_min) if d_max - d_min > 1e-8 else 0.5
+    x = (d - d_start) / (d_end - d_start) if d_end - d_start > 1e-8 else 0.5
     factor = point_condition(x)
 
     half_w = factor * available_width / 2.0
@@ -260,7 +258,6 @@ def hole_width_interval(piece, point_condition, hole_margin, thickness):
     if he - hs < 1e-6:
         return None
     return hs, he
-
 
 def bridge_width_interval(piece, bridge_height, margin, thickness):
     """Width policy for bridges: constant bridge_height, centered in the

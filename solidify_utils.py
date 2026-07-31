@@ -10,6 +10,7 @@ import numpy as np
 import trimesh
 from shapely.geometry import box
 from shapely.ops import unary_union
+from shapely.geometry import box, Polygon as ShapelyPolygon
 
 def solidify_rib_line(intervals, origin_const, axis_d, line_dir_3d, slab_normal,
                        thickness, over_extrude=0.0):
@@ -24,16 +25,31 @@ def solidify_rib_line(intervals, origin_const, axis_d, line_dir_3d, slab_normal,
     origin_const, axis_d : together give 3D(d,t) = origin_const +
         d*axis_d + t*line_dir_3d -- the same parametrization already
         used correctly by iter_solid_pieces/t_to_3d for the flat ribbon.
+
+    Builds ONE continuous strip polygon from the (d0,d1,t_lo,t_hi)
+    intervals -- walking the lower boundary forward and the upper
+    boundary back -- instead of unioning a pile of independent
+    axis-aligned rectangles. The old box-union approach staircased at
+    every z_step wherever the width tapered, which both looked wrong
+    and fed lots of tiny near-duplicate edges into the boolean engine.
     """
     if not intervals:
         return None
 
-    rects = [box(d0, t0, d1, t1) for d0, d1, t0, t1 in intervals if d1 > d0 and t1 > t0]
-    if not rects:
-        return None
+    # Sort by d0 to guarantee a well-ordered boundary walk regardless of
+    # caller order.
+    intervals = sorted(intervals, key=lambda iv: iv[0])
 
-    footprint = unary_union(rects)
-    if footprint.is_empty:
+    lower = [(d0, t_lo) for d0, d1, t_lo, t_hi in intervals]
+    lower.append((intervals[-1][1], intervals[-1][2]))
+    upper = [(d0, t_hi) for d0, d1, t_lo, t_hi in intervals]
+    upper.append((intervals[-1][1], intervals[-1][3]))
+
+    ring = lower + list(reversed(upper))
+    footprint = ShapelyPolygon(ring)
+    if not footprint.is_valid:
+        footprint = footprint.buffer(0)  # cheap self-intersection cleanup
+    if footprint.is_empty or footprint.area < 1e-9:
         return None
 
     polys = [footprint] if footprint.geom_type == 'Polygon' else list(footprint.geoms)
@@ -53,11 +69,12 @@ def solidify_rib_line(intervals, origin_const, axis_d, line_dir_3d, slab_normal,
         transform[:3, 0] = axis_d
         transform[:3, 1] = line_dir_3d
         transform[:3, 2] = slab_normal
-        transform[:3, 3] = origin_const - (thickness / 2.0) * slab_normal
+        transform[:3, 3] = origin_const - (thickness / 2.0 + over_extrude) * slab_normal
 
         try:
             solid = trimesh.creation.extrude_triangulation(
-                vertices=verts2d, faces=faces, height=thickness + 2 * over_extrude, transform=transform
+                vertices=verts2d, faces=faces,
+                height=thickness + 2 * over_extrude, transform=transform
             )
         except Exception:
             continue
@@ -104,20 +121,6 @@ def tree_union(meshes, engine='manifold'):
     return meshes[0]
 
 def solidify_flat_segment(seg_mesh, dir_rib, slab_normal, plane_offset, thickness):
-    """
-    Extrude an already-planar rib segment mesh (from
-    build_rib_segments_analytical) into a solid, thickness/2 on each
-    side of its own plane along slab_normal.
-
-    The segment lies in the plane spanned by dir_rib and the in-plane
-    direction perpendicular to it (normal = slab_normal) -- NOT the
-    (prim, line_dir_3d) frame used elsewhere for per-Z-slice bridge/hole
-    bookkeeping. Reusing that frame here was the bug: prim (global Z)
-    is generally not within this segment's own tilted plane, so
-    reprojecting onto (prim, line_dir_3d) sheared every rib segment
-    toward the same global direction, making them all look parallel
-    instead of following their own rib line's angle.
-    """
     if seg_mesh is None or len(seg_mesh.vertices) == 0:
         return None
 
@@ -133,6 +136,23 @@ def solidify_flat_segment(seg_mesh, dir_rib, slab_normal, plane_offset, thicknes
         seg_mesh.vertices @ axis_v,
     ])
 
+    # Defensive: collapse any coincident-but-index-distinct vertices
+    # (e.g. around a cutout rim from triangulate_polygon) before
+    # extrusion -- extrude_triangulation finds its boundary loop by
+    # edge-occurrence count, which duplicate vertices silently break.
+    flat = trimesh.Trimesh(
+        vertices=np.column_stack([verts2d, np.zeros(len(verts2d))]),
+        faces=seg_mesh.faces,
+        process=False,
+    )
+    flat.merge_vertices()
+    try:
+        flat.update_faces(flat.nondegenerate_faces())
+    except Exception:
+        pass
+    verts2d = flat.vertices[:, :2]
+    faces = flat.faces
+
     transform = np.eye(4)
     transform[:3, 0] = axis_u
     transform[:3, 1] = axis_v
@@ -141,13 +161,37 @@ def solidify_flat_segment(seg_mesh, dir_rib, slab_normal, plane_offset, thicknes
 
     try:
         solid = trimesh.creation.extrude_triangulation(
-            vertices=verts2d, faces=seg_mesh.faces, height=thickness, transform=transform
+            vertices=verts2d, faces=faces, height=thickness, transform=transform
         )
-    except Exception:
+    except Exception as e:
+        print(f"solidify_flat_segment: extrude_triangulation failed: {e}")
         return None
-    solid.fix_normals()
+
+    try:
+        solid.merge_vertices()
+    except Exception:
+        pass
+    try:
+        flat.update_faces(flat.nondegenerate_faces())
+    except Exception:
+        pass
+    try:
+        solid.fix_normals()
+    except Exception:
+        pass
+    try:
+        trimesh.repair.fill_holes(solid, max_hole=thickness * 4)
+    except Exception:
+        pass
+    try:
+        solid.fix_normals()
+    except Exception:
+        pass
 
     if not solid.is_watertight or not solid.is_winding_consistent:
+        print(f"solidify_flat_segment: still not clean after repair "
+              f"(watertight={solid.is_watertight}, winding={solid.is_winding_consistent}, "
+              f"verts={len(solid.vertices)}, faces={len(solid.faces)}) -- discarding")
         return None
     if solid.volume < 0:
         solid.invert()
