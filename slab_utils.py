@@ -15,6 +15,7 @@ from shapely.geometry import Polygon as ShapelyPolygon
 from viz_utils import show_mesh
 from shapely.ops import linemerge, polygonize
 from shapely.geometry import Polygon as ShapelyPolygon, LineString
+from shapely.affinity import affine_transform
 from scipy.spatial import ConvexHull
 
 def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
@@ -560,10 +561,38 @@ def build_rib_segments_analytical(wing_mesh, all_lines_np, plane_normal_np,
         if wing_poly.is_empty or wing_poly.area < 1e-6:
             continue
 
-        to_3d_mat = np.array(to_3d)   # (4,4)
-        origin_3d = to_3d_mat[:3, 3]
-        u_poly = to_3d_mat[:3, 0]
-        v_poly = to_3d_mat[:3, 1]
+        # section.to_planar() picks an ARBITRARY in-plane basis, but the
+        # cell-splitting below cuts axis-aligned bands in u and therefore
+        # only works if u runs along the rib. Whether it does is pure
+        # luck: with construction plane XZ / primary_dir Z trimesh happens
+        # to give u == d_i, but with XY / primary_dir Y it gives v == d_i
+        # instead -- every crossing then projects to the SAME u, the band
+        # widths collapse below the 1e-8 guard, and the rib yields zero
+        # segments. So re-express the polygon in our own frame with u
+        # pinned to the rib direction. As a bonus this makes u strictly
+        # increasing in s, so crossing_u and crossing_params below stay
+        # in lockstep instead of being two independently-sorted lists.
+        to_3d_in = np.array(to_3d)      # (4,4) from to_planar
+        origin_3d = to_3d_in[:3, 3]
+        u_in = to_3d_in[:3, 0]
+        v_in = to_3d_in[:3, 1]
+
+        u_poly = d_i                    # in-plane, unit, along the rib
+        v_poly = np.cross(N_i, u_poly)  # in-plane, unit (N_i ⟂ d_i)
+
+        # to_planar's frame -> ours. Both share origin_3d and are
+        # orthonormal, so this is a pure 2x2 rotation/reflection.
+        a, b = np.dot(u_in, u_poly), np.dot(v_in, u_poly)
+        c, e = np.dot(u_in, v_poly), np.dot(v_in, v_poly)
+        wing_poly = affine_transform(wing_poly, [a, b, c, e, 0.0, 0.0])
+        if wing_poly.is_empty or wing_poly.area < 1e-6:
+            continue
+
+        to_3d_mat = np.eye(4)
+        to_3d_mat[:3, 0] = u_poly
+        to_3d_mat[:3, 1] = v_poly
+        to_3d_mat[:3, 2] = N_i
+        to_3d_mat[:3, 3] = origin_3d
 
         def project_to_local(pt3d):
             delta = pt3d - origin_3d

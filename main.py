@@ -286,6 +286,11 @@ def main(params):
     cache_filename = f"{params.obj_name}.pkl"
     cache_path = os.path.join(cache_dir, cache_filename)
 
+    # The cached slices are taken ALONG primary_dir, so it has to be part
+    # of the validity key -- otherwise changing primary_dir (e.g. Z -> Y)
+    # silently reloads slices cut along the old axis.
+    cached_dir_key = tuple(np.round(primary_dir_np, 9))
+
     z_vals, slices = None, None
     if os.path.exists(cache_path):
         print(f"Loading cached slices from {cache_path}...")
@@ -293,12 +298,13 @@ def main(params):
             with open(cache_path, 'rb') as f:
                 data = pickle.load(f)
             if (data.get('z_step') == params.z_step and
-                data.get('mesh_hash') == mesh_hash):
+                data.get('mesh_hash') == mesh_hash and
+                data.get('primary_dir') == cached_dir_key):
                 z_vals = data['z_vals']
                 slices = data['slices']
                 print(f"Loaded {len(slices)} slices from cache.")
             else:
-                print("Cache is stale (mesh or z_step changed); recomputing...")
+                print("Cache is stale (mesh, z_step or primary_dir changed); recomputing...")
         except Exception as e:
             print(f"Failed to load cache ({e}); recomputing...")
 
@@ -310,7 +316,8 @@ def main(params):
         try:
             with open(cache_path, 'wb') as f:
                 pickle.dump({'z_vals': z_vals, 'slices': slices,
-                             'z_step': params.z_step, 'mesh_hash': mesh_hash}, f)
+                             'z_step': params.z_step, 'mesh_hash': mesh_hash,
+                             'primary_dir': cached_dir_key}, f)
             print(f"Slices cached to {cache_path}")
         except Exception as e:
             print(f"Warning: could not save slice cache: {e}")
@@ -382,9 +389,9 @@ def main(params):
         })
 
     # ---- Merge rib segments back into one mesh per rib line ----
-    # Bridges are built per full rib line rather than per rib segment so
-    # they run continuously through rib-rib intersections instead of
-    # restarting (and sometimes gapping) at every crossing.
+    # Bridges are built per full rib line rather than per rib segment, so
+    # each rib gets ONE bridge centred in its full chord (where the
+    # geometry allows) instead of one strut per crossing-to-crossing cell.
     line_meshes, line_bridge_segments = merge_rib_segments_by_line(
         rib_segments, segment_bounds, lines_data
     )
@@ -396,7 +403,6 @@ def main(params):
         primary_dir_np,
         z_vals=z_vals,
         bridge_height=params.bridge_height,
-        margin=0.0,          # or params.bridge_margin if you want one
         doc=doc,
         vis=params.vis_bridge,
         thickness=params.thickness, 
@@ -486,23 +492,29 @@ if __name__ == "__main__":
                'axis_v': FreeCAD.Vector(0, 0, 1)},
     }
 
-    construction_plane = 'XZ'
+    # NOTE: primary_dir must LIE IN this plane, never along its normal.
+    # It doubles as the in-plane reference direction for the rib grid
+    # (create_angled_grid_lines does cross(plane_normal, primary_dir),
+    # which is degenerate when the two are parallel). So slicing along Y
+    # needs 'XY' (normal Z) or 'YZ' (normal X) -- NOT 'XZ', whose normal
+    # IS Y.
+    construction_plane = 'XY'
     pdef = PLANE_DEFS[construction_plane]
 
     params = SimpleNamespace(
-        doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wing.FCStd",
-        # doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.FCStd",
-        obj_name='WingR3_msv001_solid',
-        # obj_name='WingR1_msv_orient001_solid',
-        out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR3.stl",
-        # out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR1.stl",
-        rib_spacing=20.0,
+        doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR1.FCStd",
+        # obj_name='WingR3_msv001_solid',
+        # obj_name='WingR2_msv001_solid',
+        obj_name='Cut001',
+        # out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR3.stl",
+        out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR1.stl",
+        rib_spacing=30.0,
         rib_angle=30.0,
-        grid_orientation=0.0,
-        primary_dir=FreeCAD.Vector(0, 0, 1),
+        grid_orientation=90.0,
+        primary_dir=FreeCAD.Vector(0, 1, 0),
         bridge_height=1,
-        hole_margin=2,
-        thickness=0.3,
+        hole_margin=0.8,
+        thickness=0.2,
         input_step_path="",
         vis_rib_centre_surfaces=False,
         vis_rib_centre_surfaces_clip=False,
@@ -529,6 +541,16 @@ if __name__ == "__main__":
         if proj.Length > 1e-6:
             params.primary_dir = proj.normalize()
         else:
-            params.primary_dir = None
+            # primary_dir is (anti)parallel to the construction plane's
+            # normal, so projecting it into the plane leaves nothing.
+            # main() dereferences primary_dir unconditionally, so falling
+            # back to None here just defers the failure into a confusing
+            # AttributeError -- fail loudly and say what to change.
+            raise ValueError(
+                f"primary_dir {(pd.x, pd.y, pd.z)} is parallel to the "
+                f"'{construction_plane}' plane normal {(n.x, n.y, n.z)}; it must "
+                f"lie IN the construction plane. Pick a construction_plane whose "
+                f"normal is not parallel to primary_dir."
+            )
 
     main(params)

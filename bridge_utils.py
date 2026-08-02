@@ -2,8 +2,9 @@
 # rib_segment meshes directly, built on the same shared slicing/void
 # logic as hole_utils_analytical.py (see rib_slice_core.py).
 #
-# Width policy: constant bridge_height, centered in the chosen piece; if
-# it doesn't fit, no bridge at that slice (no clamping). See
+# Width policy: constant bridge_height, centered in the chosen piece's
+# raw solid extent (no margin inset -- that's holes-only); if it doesn't
+# fit, no bridge at that slice (no clamping). See
 # rib_slice_core.bridge_width_interval.
 #
 # If thickness is given, ALSO builds the real extruded volume (per rib
@@ -21,7 +22,7 @@ from solidify_utils import solidify_rib_line, tree_union
 
 
 def create_bridges_analytical(rib_segment_meshes, bridge_segments, primary_dir_np,
-                               z_vals, bridge_height, margin=0.0,
+                               z_vals, bridge_height,
                                doc=None, vis=False,
                                thickness=None, boolean_engine='manifold',
                                over_extrude=0.02):
@@ -38,11 +39,6 @@ def create_bridges_analytical(rib_segment_meshes, bridge_segments, primary_dir_n
             f"length and correspond index-for-index."
         )
 
-    # bridge_width_interval needs a numeric thickness for its margin term
-    # even when the caller didn't ask for a solid (thickness=None) --
-    # fall back to 0 so the margin behaves exactly as before in that case.
-    margin_thickness = thickness if thickness is not None else 0.0
-
     prim, u_ax, v_ax = basis_vectors(primary_dir_np)
 
     all_vertices = []
@@ -52,7 +48,7 @@ def create_bridges_analytical(rib_segment_meshes, bridge_segments, primary_dir_n
     solids = [] if thickness is not None else None
 
     def policy(piece):
-        return bridge_width_interval(piece, bridge_height, margin, margin_thickness)
+        return bridge_width_interval(piece, bridge_height)
 
     for seg_mesh, seg in zip(rib_segment_meshes, bridge_segments):
         ribbons = []

@@ -259,17 +259,14 @@ def hole_width_interval(piece, point_condition, hole_margin, thickness):
         return None
     return hs, he
 
-def bridge_width_interval(piece, bridge_height, margin, thickness):
+def bridge_width_interval(piece, bridge_height):
     """Width policy for bridges: constant bridge_height, centered in the
-    piece. Same thickness-aware margin reasoning as hole_width_interval
-    -- bridges sit right at the rib crossing too, so they need the same
-    clearance from the neighboring rib's extruded volume.
-    Returns None if it doesn't fit (no clamping)."""
-    eff_margin = margin + 0.5 * thickness
-    t_start = piece['t_min_solid'] + eff_margin
-    t_end = piece['t_max_solid'] - eff_margin
-    available_width = t_end - t_start
-    if available_width < bridge_height:
+    piece, using the piece's raw solid extent. No margin term -- unlike
+    holes, bridges are the load-carrying material itself, so they get no
+    clearance inset. Returns None if it doesn't fit (no clamping)."""
+    t_start = piece['t_min_solid']
+    t_end = piece['t_max_solid']
+    if t_end - t_start < bridge_height:
         return None
     t_center = (t_start + t_end) / 2.0
     return t_center - bridge_height / 2.0, t_center + bridge_height / 2.0
