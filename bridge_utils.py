@@ -2,10 +2,12 @@
 # rib_segment meshes directly, built on the same shared slicing/void
 # logic as hole_utils_analytical.py (see rib_slice_core.py).
 #
-# Width policy: constant bridge_height, centered in the chosen piece's
-# raw solid extent (no margin inset -- that's holes-only); if it doesn't
-# fit, no bridge at that slice (no clamping). See
-# rib_slice_core.bridge_width_interval.
+# Width policy: bridge_height wide, centered in the chosen piece's raw
+# solid extent (no margin inset -- that's holes-only). A bridge is made
+# at EVERY slice that has solid to sit in: where the piece is narrower
+# than bridge_height the width is clamped to what's available instead of
+# the slice being skipped, so the bridge column stays continuous through
+# thin sections. See rib_slice_core.bridge_width_interval.
 #
 # If thickness is given, ALSO builds the real extruded volume (per rib
 # line, then unioned) in the same pass.

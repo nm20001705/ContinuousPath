@@ -259,17 +259,31 @@ def hole_width_interval(piece, point_condition, hole_margin, thickness):
         return None
     return hs, he
 
-def bridge_width_interval(piece, bridge_height):
-    """Width policy for bridges: constant bridge_height, centered in the
-    piece, using the piece's raw solid extent. No margin term -- unlike
-    holes, bridges are the load-carrying material itself, so they get no
-    clearance inset. Returns None if it doesn't fit (no clamping)."""
+def bridge_width_interval(piece, bridge_height, min_width=1e-6):
+    """Width policy for bridges: bridge_height wide, centered in the
+    piece's raw solid extent. No margin term -- unlike holes, bridges are
+    the load-carrying material itself, so they get no clearance inset.
+
+    A bridge is produced at EVERY slice that has solid to sit in. Where
+    the piece is narrower than bridge_height the bridge is CLAMPED to the
+    full available width rather than skipped, so a bridge never breaks up
+    just because the wall thins -- which is exactly where the section is
+    weakest and the bridge matters most. Previously such slices returned
+    None, leaving gaps in the bridge column near the leading/trailing
+    edge and the tip.
+
+    Returns None only when there is no usable solid at all (a degenerate
+    or empty extent); a zero-width strip is not a thin bridge, it is
+    geometry that would break the extrude/boolean downstream.
+    """
     t_start = piece['t_min_solid']
     t_end = piece['t_max_solid']
-    if t_end - t_start < bridge_height:
+    available = t_end - t_start
+    if available < min_width:
         return None
     t_center = (t_start + t_end) / 2.0
-    return t_center - bridge_height / 2.0, t_center + bridge_height / 2.0
+    half = min(bridge_height, available) / 2.0
+    return t_center - half, t_center + half
 
 
 def collect_line_intervals(seg_mesh, seg, prim, u_ax, v_ax, z_vals, width_policy_fn):

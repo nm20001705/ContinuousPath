@@ -26,7 +26,8 @@ from hole_utils import create_holes_analytical
 from viz_utils import fit_view, show_rib_centre_lines
 
 from rib_solid_utils import build_rib_solid_analytical
-from assembly_utils_freecad import assemble_final_wing_freecad
+from assembly_utils_freecad import (assemble_final_wing_freecad,
+                                    assemble_final_wing_trimesh)
 from rib_solid_utils import build_full_rib_solid
 import MeshPart
 
@@ -207,6 +208,37 @@ def main(params):
         if not wing_obj:
             raise RuntimeError("Object not found.")
         wing_shape = wing_obj.Shape
+
+    # ---- Input sanity check (cheap, and it runs FIRST) ----
+    # Part.Shape.isValid() is NOT the test that matters here: it checks
+    # that each face is well formed, not that the shape closes into a
+    # volume. Cut001_solid reported isValid()==True while being
+    # isClosed()==False with 4 shells and a volume of -336, which is why
+    # FreeCAD's Check Geometry kept passing it. What the final
+    # wing_shape.cut() actually needs is a CLOSED, single-shell solid
+    # with a plausible positive volume -- without that the cut either
+    # returns a Null shape or grinds for hours in OCC's non-solid path,
+    # and you only find out ten minutes into the run.
+    print(f"Input '{params.obj_name}': {len(wing_shape.Faces)} faces, "
+          f"type={wing_shape.ShapeType}, valid={wing_shape.isValid()}, "
+          f"closed={wing_shape.isClosed()}, solids={len(wing_shape.Solids)}, "
+          f"shells={len(wing_shape.Shells)}, volume={wing_shape.Volume:.1f}")
+    _problems = []
+    if not wing_shape.isClosed():
+        _problems.append("not closed")
+    if len(wing_shape.Shells) > 1:
+        _problems.append(f"{len(wing_shape.Shells)} shells (expected 1)")
+    if wing_shape.Volume <= 0:
+        _problems.append(f"non-positive volume ({wing_shape.Volume:.1f})")
+    if _problems:
+        print("  *** INPUT IS NOT A CLOSED SOLID: " + "; ".join(_problems) + " ***")
+        print("  The rib cut will be unreliable and may be extremely slow. "
+              "Regenerate this object as a closed single-shell solid "
+              "(WingR2/WingR3 in this project are correct examples).")
+    elif len(wing_shape.Faces) > 50000:
+        print(f"  note: {len(wing_shape.Faces)} faces is very high (a "
+              f"mesh-derived solid). Valid, but the BREP cut scales roughly "
+              f"as faces^1.5 -- ~105s at 166k faces vs ~3.5s at 18k.")
 
     # ---- Convert wing to trimesh (with minimal repair) ----
     print("Converting wing to trimesh...")
@@ -441,14 +473,27 @@ def main(params):
     )
 
     # ---- Final assembly: wing - (rib_solid - bridge_solid - hole_solid) ----
-    wing_obj = assemble_final_wing_freecad(
-        wing_shape,
-        rib_solid,
-        bridge_solid,
-        hole_solid,
-        doc=doc,
-        vis=params.vis_final,
-    )
+    # When the wing mesh is watertight, both operands are genuine volumes
+    # and trimesh/manifold does this cut in seconds. BREP is only worth
+    # its cost on real surface models; these wings are mesh-derived, so
+    # OCC pays full triangle-soup price (168k x 37.5k faces = hours) for
+    # nothing. Fall back to BREP only when the wing isn't a valid volume.
+    wing_obj = None
+    final_mesh = None
+    if getattr(params, 'trimesh_assembly', True) and wing_mesh.is_watertight:
+        final_mesh, _ = assemble_final_wing_trimesh(
+            wing_mesh, rib_solid, bridge_solid, hole_solid)
+
+    if final_mesh is None:
+        print("Using the BREP assembly path...")
+        wing_obj = assemble_final_wing_freecad(
+            wing_shape,
+            rib_solid,
+            bridge_solid,
+            hole_solid,
+            doc=doc,
+            vis=params.vis_final,
+        )
 
     # ---- Show centre lines if requested ----
     if params.vis_centre_lines:
@@ -468,7 +513,25 @@ def main(params):
         except Exception as e:
             print(f"Wing mesh visualisation error: {e}")
 
-    if wing_obj is not None:
+    if final_mesh is not None:
+        # Already a triangle mesh -- write it directly. No BREP sewing
+        # tolerance and no re-tessellation, so the thin rib slits survive
+        # exactly as computed.
+        final_mesh.export(params.out_path)
+        print(f"Exported STL: {params.out_path} ({len(final_mesh.vertices)} verts, "
+              f"{len(final_mesh.faces)} facets, watertight={final_mesh.is_watertight})")
+        if params.vis_final:
+            try:
+                from slab_utils import trimesh_to_freecad
+                fc_mesh = trimesh_to_freecad(final_mesh)
+                if fc_mesh:
+                    from viz_utils import show_mesh
+                    show_mesh(fc_mesh, doc, "WingFinalMesh",
+                              color=(0.75, 0.75, 0.75), transparency=10)
+                    doc.recompute()
+            except Exception as e:
+                print(f"Final mesh visualisation error: {e}")
+    elif wing_obj is not None:
         export_wing_stl(wing_obj, params.out_path, linear_deflection=0.05)
     # ---- Save ----
     doc.save()
@@ -498,23 +561,25 @@ if __name__ == "__main__":
     # which is degenerate when the two are parallel). So slicing along Y
     # needs 'XY' (normal Z) or 'YZ' (normal X) -- NOT 'XZ', whose normal
     # IS Y.
-    construction_plane = 'XY'
+    construction_plane = 'XZ'
     pdef = PLANE_DEFS[construction_plane]
 
     params = SimpleNamespace(
         doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR1.FCStd",
+        # doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.FCStd",
         # obj_name='WingR3_msv001_solid',
         # obj_name='WingR2_msv001_solid',
-        obj_name='Cut001',
-        # out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR3.stl",
+        obj_name='WingR1_fixed001_solid',
+        # obj_name='Part__Feature_solid',
         out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR1.stl",
+        # out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.stl",
         rib_spacing=30.0,
         rib_angle=30.0,
-        grid_orientation=90.0,
-        primary_dir=FreeCAD.Vector(0, 1, 0),
+        grid_orientation=0.0,
+        primary_dir=FreeCAD.Vector(0, 0, 1),
         bridge_height=1,
         hole_margin=0.8,
-        thickness=0.2,
+        thickness=0.1,
         input_step_path="",
         vis_rib_centre_surfaces=False,
         vis_rib_centre_surfaces_clip=False,

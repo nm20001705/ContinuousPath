@@ -84,7 +84,135 @@ def trimesh_to_part_solid(tm, tolerance=0.01):
         except Exception:
             pass
 
+    # An invalid or unclosed cut tool does not make wing_shape.cut() raise
+    # -- it either returns a Null shape or sends OCC down its very slow
+    # non-solid path. Report it here, where the cause is, instead of
+    # letting it surface later as an unexplained failure or a hang.
+    if solid is not None:
+        print(f"  cut_part: {len(solid.Faces)} faces, {len(solid.Solids)} solid(s), "
+              f"valid={solid.isValid()}, closed={solid.isClosed()}")
+        if not solid.isValid() or not solid.isClosed():
+            print("  WARNING: cut_part is not a valid closed solid -- the wing "
+                  "cut will be unreliable and may be extremely slow.")
+
     return solid
+
+def drop_sliver_components(mesh, min_volume=1e-6, verbose=True):
+    """
+    Remove zero-volume debris the boolean leaves along the slit edges.
+
+    Cutting 0.1mm-thick slabs out of a wing produces a lot of very thin
+    geometry, and the boolean sheds a handful of degenerate scraps: on
+    this wing, 7 extra "components" totalling 46 faces, every one of them
+    with |volume| == 0.00 (largest 10.55 x 0.09 x 0.00 mm -- a flat
+    ribbon with no thickness at all). They are harmless to slicers but
+    they make the exported STL report watertight=False, which hides real
+    problems.
+
+    Components are dropped on VOLUME, not on size or count, so a
+    genuinely detached but solid piece (which this design can legitimately
+    produce, since full-depth slabs can isolate a cell) is always kept.
+    """
+    if mesh is None:
+        return mesh
+    try:
+        comps = mesh.split(only_watertight=False)
+    except Exception as e:
+        if verbose:
+            print(f"  sliver cleanup skipped ({e})")
+        return mesh
+
+    if len(comps) <= 1:
+        return mesh
+
+    keep = [c for c in comps if abs(c.volume) >= min_volume]
+    dropped = len(comps) - len(keep)
+    if not keep or dropped == 0:
+        return mesh
+
+    # Take the surviving components exactly as split() produced them. Do
+    # NOT merge_vertices() here: around 0.1mm slits there are legitimately
+    # distinct vertices a hair apart, and welding them creates
+    # non-manifold edges -- that alone turned a watertight result into a
+    # leaky one, even though every dropped component was a closed
+    # zero-volume shell that removing could not possibly open.
+    out = trimesh.util.concatenate(keep) if len(keep) > 1 else keep[0]
+
+    # Dropping whole components must not open the parts we keep. Deleting
+    # degenerate FACES would (a watertight mesh can need zero-area faces
+    # to stay closed), which is why this only ever removes complete
+    # components -- and verifies afterwards, reverting if it went wrong.
+    if mesh.is_watertight and not out.is_watertight:
+        if verbose:
+            print("  sliver cleanup would break watertightness -- keeping "
+                  "the mesh intact instead")
+        return mesh
+
+    if verbose:
+        lost = len(mesh.faces) - len(out.faces)
+        print(f"  dropped {dropped} zero-volume sliver component(s) "
+              f"({lost} faces); {len(keep)} solid part(s) kept, "
+              f"watertight={out.is_watertight}")
+    return out
+
+
+def assemble_final_wing_trimesh(wing_mesh_tm, rib_solid_tm, bridge_solid_tm,
+                                 hole_solid_tm, boolean_engine='manifold'):
+    """
+    Do the whole assembly in trimesh: wing - (rib - bridge - hole).
+
+    Use this whenever `wing_mesh_tm` is watertight. Both operands are
+    already valid volumes by construction (rib/bridge/hole are each
+    watertight and manifold booleans preserve that), so there is nothing
+    BREP can add here -- and plenty it takes away. The BREP route must
+    first sew the cut tool into a Part solid, which loses faces to the
+    sewing tolerance (37578 -> 37539, valid=False on this wing) and then
+    runs a triangle-soup boolean against a 168k-face wing. Measured on
+    this geometry: manifold does the equivalent cut in ~0.3s, OCC takes
+    hours. The wing solids here are mesh-derived, so BREP is carrying all
+    the cost of exact surface algebra with none of the benefit.
+
+    Returns (final_mesh, cut_solid); final_mesh is None on failure.
+    """
+    if wing_mesh_tm is None or not wing_mesh_tm.is_watertight:
+        print("assemble_final_wing_trimesh: wing mesh is not watertight -- "
+              "refusing (the result would have no real internal structure).")
+        return None, None
+    if rib_solid_tm is None or len(rib_solid_tm.vertices) == 0:
+        print("assemble_final_wing_trimesh: no rib_solid, nothing to cut.")
+        return None, None
+
+    cut_solid_tm = rib_solid_tm
+    for label, other in (("bridges", bridge_solid_tm), ("holes", hole_solid_tm)):
+        if other is None or len(other.vertices) == 0:
+            continue
+        try:
+            cut_solid_tm = trimesh.boolean.difference(
+                [cut_solid_tm, other], engine=boolean_engine)
+            print(f"  rib - {label}: {len(cut_solid_tm.faces)} faces, "
+                  f"watertight={cut_solid_tm.is_watertight}")
+        except Exception as e:
+            print(f"assemble_final_wing_trimesh: rib - {label} failed: {e}")
+            return None, cut_solid_tm
+
+    try:
+        final = trimesh.boolean.difference(
+            [wing_mesh_tm, cut_solid_tm], engine=boolean_engine)
+    except Exception as e:
+        print(f"assemble_final_wing_trimesh: wing - cut_solid failed: {e}")
+        return None, cut_solid_tm
+
+    final = drop_sliver_components(final)
+
+    removed = wing_mesh_tm.volume - final.volume
+    print(f"Final (trimesh): {len(final.faces)} faces, "
+          f"watertight={final.is_watertight}, volume={final.volume:.1f}")
+    print(f"  material removed by ribs: {removed:.1f} mm^3 "
+          f"({100.0 * removed / wing_mesh_tm.volume:.2f}% of the wing)")
+    if removed <= 0:
+        print("  WARNING: nothing was removed -- the cut did not take effect.")
+    return final, cut_solid_tm
+
 
 def assemble_final_wing_freecad(wing_shape, rib_solid_tm, bridge_solid_tm, hole_solid_tm,
                                  doc=None, vis=False, mesh_tolerance=0.01,
@@ -124,11 +252,35 @@ def assemble_final_wing_freecad(wing_shape, rib_solid_tm, bridge_solid_tm, hole_
     print(f"cut_solid (trimesh): {len(cut_solid_tm.vertices)} verts, "
           f"{len(cut_solid_tm.faces)} faces, watertight={cut_solid_tm.is_watertight}")
 
-    # ---- Step 2a: lossless redundancy removal (coplanar merge) ----
-    cut_solid_tm = merge_coplanar_faces(cut_solid_tm)
-    if not cut_solid_tm.is_watertight:
-        print("Warning: coplanar merge broke watertightness, this shouldn't "
-              "normally happen -- check min_group_size / tolerances.")
+    # ---- Step 2a: coplanar merge -- ONLY if it stays watertight ----
+    # cut_solid arrives watertight (rib/bridge/hole are each watertight and
+    # manifold booleans preserve that), so the tool is already valid by
+    # construction -- nothing here needs repairing. The merge is the only
+    # step that can invalidate it: it re-triangulates each planar patch
+    # from its merged boundary, so new edges span several original ones
+    # and neighbouring faces land mid-edge (T-junctions), leaving
+    # unmatched edges. A leaky mesh sews into a shell, Part.makeSolid()
+    # then fails ("Creation of solid failed"), and cutting the wing with
+    # the raw shell that gets used instead either returns a Null shape or
+    # grinds for hours in OCC's non-solid path.
+    #
+    # Measured on WingR2 (same geometry, merge the only difference):
+    #   without merge: 1560 faces, watertight -> tool valid=True,
+    #                  closed=True  -> cut 13.0s, result valid=True
+    #   with merge   : 1431 faces, leaky      -> tool valid=False
+    #                  -> cut 12.5s, result valid=False
+    # Same runtime and the same 509.3 mm^3 removed, so the merge's only
+    # measurable effect here is to destroy validity. Keep it when it is
+    # genuinely lossless, discard it otherwise.
+    pre_merge_tm = cut_solid_tm
+    merged_tm = merge_coplanar_faces(cut_solid_tm)
+    if merged_tm is not None and merged_tm.is_watertight:
+        cut_solid_tm = merged_tm
+    else:
+        print(f"Coplanar merge broke watertightness -- discarding it and "
+              f"keeping the pre-merge mesh ({len(pre_merge_tm.faces)} faces), "
+              f"which is still a valid volume.")
+        cut_solid_tm = pre_merge_tm
 
     # ---- Step 2b: lossy simplification -- SKIP unless coplanar merge
     # wasn't enough. Quadric decimation collapses small notches (like the
