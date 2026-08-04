@@ -23,6 +23,7 @@ from slab_utils import (
 )
 from bridge_utils import create_bridges_analytical
 from hole_utils import create_holes_analytical
+from rib_slice_core import basis_vectors
 from viz_utils import fit_view, show_rib_centre_lines
 
 from rib_solid_utils import build_rib_solid_analytical
@@ -52,12 +53,12 @@ def export_wing_stl(wing_obj, filepath, linear_deflection=0.05, angular_deflecti
 # Precompute wing cross‑sections for all Z‑slices
 # ------------------------------------------------------------
 def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
-    if abs(prim[0]) > 0.9:
-        u_ax = np.cross(prim, [0, 1, 0])
-    else:
-        u_ax = np.cross(prim, [1, 0, 0])
-    u_ax = u_ax / np.linalg.norm(u_ax)
-    v_ax = np.cross(prim, u_ax)
+    # The (u,v) basis MUST be the one rib_slice_core uses, or the cached
+    # slices are expressed in a different frame than the bridges/holes
+    # computed from them. It used to be copy-pasted here (and a third
+    # time in slab_utils), which meant three places had to be edited in
+    # lockstep for that invariant to hold.
+    _, u_ax, v_ax = basis_vectors(prim)
 
     z_vals = []
     slices = []          # list of lists: each element is a list of (poly, to_3d)

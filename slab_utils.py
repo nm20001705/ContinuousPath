@@ -1,106 +1,18 @@
 # slab_utils.py – Mesh-optimised using trimesh (fully corrected)
 
-import FreeCAD
-import Part
-import Mesh
-import MeshPart
 import math
 import os
 import tempfile
+
+import Mesh
+import MeshPart
 import numpy as np
 import trimesh
-from shapely.geometry import Polygon as ShapelyPolygon
-import trimesh.path.polygons
-from shapely.geometry import Polygon as ShapelyPolygon
-from viz_utils import show_mesh
-from shapely.ops import linemerge, polygonize
-from shapely.geometry import Polygon as ShapelyPolygon, LineString
 from shapely.affinity import affine_transform
-from scipy.spatial import ConvexHull
+from shapely.geometry import Polygon as ShapelyPolygon
 
-def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
-    """Return dict { rounded_d : (polygon_2d, to_3d_matrix) } for every slice."""
-    # Same basis vectors that bridge/hole functions will use
-    if abs(prim[0]) > 0.9:
-        u_ax = np.cross(prim, [0, 1, 0])
-    else:
-        u_ax = np.cross(prim, [1, 0, 0])
-    u_ax = u_ax / np.linalg.norm(u_ax)
-    v_ax = np.cross(prim, u_ax)
+from viz_utils import show_mesh
 
-    slices = {}
-    d = d_min
-    while d <= d_max + 1e-9:
-        plane_origin = d * prim
-        try:
-            result = trimesh.intersections.mesh_plane(
-                wing_mesh, plane_normal=prim, plane_origin=plane_origin
-            )
-        except Exception:
-            d += z_step
-            continue
-        if isinstance(result, tuple):
-            lines = result[0]
-        else:
-            lines = result
-        if lines is None or len(lines) == 0:
-            d += z_step
-            continue
-
-        origin = np.asarray(plane_origin)
-        segments_2d = []
-        for seg in lines:
-            p1 = seg[0] - origin
-            p2 = seg[1] - origin
-            u1, v1 = np.dot(p1, u_ax), np.dot(p1, v_ax)
-            u2, v2 = np.dot(p2, u_ax), np.dot(p2, v_ax)
-            if np.linalg.norm([u2 - u1, v2 - v1]) > 1e-9:
-                segments_2d.append(LineString([(u1, v1), (u2, v2)]))
-
-        if not segments_2d:
-            d += z_step
-            continue
-
-        merged = linemerge(segments_2d)
-        if merged.is_empty:
-            d += z_step
-            continue
-
-        polys = list(polygonize(merged))
-        if not polys:
-            all_pts = []
-            for line in segments_2d:
-                all_pts.extend(line.coords)
-            pts = np.array(all_pts)
-            if len(pts) < 3:
-                d += z_step
-                continue
-            try:
-                hull = ConvexHull(pts)
-                poly = ShapelyPolygon(pts[hull.vertices])
-            except Exception:
-                d += z_step
-                continue
-        else:
-            poly = max(polys, key=lambda p: p.area)
-
-        if poly.is_empty or poly.area < 1e-8:
-            d += z_step
-            continue
-
-        to_3d = np.eye(4)
-        to_3d[:3, 0] = u_ax
-        to_3d[:3, 1] = v_ax
-        to_3d[:3, 3] = origin
-
-        slices[round(d, 6)] = (poly, to_3d)
-        d += z_step
-
-    return slices
-
-# ------------------------------------------------------------
-# Mesh repair (from your pure Python script)
-# ------------------------------------------------------------
 def repair_mesh(mesh):
     """
     Minimal repair that fixes only small defects while preserving
