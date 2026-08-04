@@ -45,3 +45,6 @@ venv/
 *.3mf
 *.gcode
 *.pkl
+
+# local machine-specific config (paths etc.)
+config.local.toml

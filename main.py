@@ -1,6 +1,8 @@
 # main.py – fully optimised with cached wing slices, mesh-hash protection, and robust guards
 
 from types import SimpleNamespace
+import argparse
+import tomllib
 import FreeCAD
 import Part
 import math
@@ -496,80 +498,158 @@ def main(params):
 # ------------------------------------------------------------
 # Runtime configuration
 # ------------------------------------------------------------
-if __name__ == "__main__":
-    PLANE_DEFS = {
-        'XY': {'normal': FreeCAD.Vector(0, 0, 1),
-               'axis_u': FreeCAD.Vector(1, 0, 0),
-               'axis_v': FreeCAD.Vector(0, 1, 0)},
-        'XZ': {'normal': FreeCAD.Vector(0, 1, 0),
-               'axis_u': FreeCAD.Vector(1, 0, 0),
-               'axis_v': FreeCAD.Vector(0, 0, 1)},
-        'YZ': {'normal': FreeCAD.Vector(1, 0, 0),
-               'axis_u': FreeCAD.Vector(0, 1, 0),
-               'axis_v': FreeCAD.Vector(0, 0, 1)},
-    }
+PLANE_DEFS = {
+    'XY': {'normal': FreeCAD.Vector(0, 0, 1),
+           'axis_u': FreeCAD.Vector(1, 0, 0),
+           'axis_v': FreeCAD.Vector(0, 1, 0)},
+    'XZ': {'normal': FreeCAD.Vector(0, 1, 0),
+           'axis_u': FreeCAD.Vector(1, 0, 0),
+           'axis_v': FreeCAD.Vector(0, 0, 1)},
+    'YZ': {'normal': FreeCAD.Vector(1, 0, 0),
+           'axis_u': FreeCAD.Vector(0, 1, 0),
+           'axis_v': FreeCAD.Vector(0, 0, 1)},
+}
 
-    # NOTE: primary_dir must LIE IN this plane, never along its normal.
-    # It doubles as the in-plane reference direction for the rib grid
-    # (create_angled_grid_lines does cross(plane_normal, primary_dir),
-    # which is degenerate when the two are parallel). So slicing along Y
-    # needs 'XY' (normal Z) or 'YZ' (normal X) -- NOT 'XZ', whose normal
-    # IS Y.
-    construction_plane = 'XZ'
-    pdef = PLANE_DEFS[construction_plane]
+_PATH_KEYS = ('doc_path', 'out_path', 'input_step_path')
 
-    params = SimpleNamespace(
-        doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR1.FCStd",
-        # doc_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.FCStd",
-        # obj_name='WingR3_msv001_solid',
-        # obj_name='WingR2_msv001_solid',
-        obj_name='WingR1_fixed001_solid',
-        # obj_name='Part__Feature_solid',
-        out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\wingR1.stl",
-        # out_path=r"C:\Users\natha\Desktop\plane\3D\Slop3r V-tail slope glider 1.2 m span - 4647489\0_make_struct\fin.stl",
-        rib_spacing=30.0,
-        rib_angle=30.0,
-        grid_orientation=0.0,
-        primary_dir=FreeCAD.Vector(0, 0, 1),
-        bridge_height=1,
-        hole_margin=0.8,
-        thickness=0.1,
-        input_step_path="",
-        vis_rib_centre_surfaces=False,
-        vis_rib_centre_surfaces_clip=False,
-        vis_rib_segments=True,
-        vis_centre_lines=False,
-        vis_bridge=True,
-        vis_hole=True,
-        vis_wing=False,
-        vis_rib_solid=True,
-        vis_final=True,
-        z_step=1, 
-        rib_protrusion_margin = 2
-    )
 
+def _resolve_path(value, base_dir):
+    """Absolute paths pass through; relative ones resolve against
+    base_dir, so the tracked config carries no machine-specific paths."""
+    if not value:
+        return ""
+    value = os.path.expanduser(value)
+    if os.path.isabs(value):
+        return value
+    return os.path.normpath(os.path.join(base_dir, value))
+
+
+def _read_toml(config_path):
+    """Parse a TOML file, tolerating a UTF-8 BOM.
+
+    tomllib rejects a BOM outright ("Invalid statement at line 1"), and
+    on Windows a BOM is easy to introduce by accident -- PowerShell 5.1's
+    `Out-File -Encoding utf8` and several editors add one silently. The
+    resulting error points at line 1 of a file that looks perfectly fine,
+    so strip it rather than make anyone debug that.
+    """
+    if not os.path.exists(config_path):
+        raise SystemExit(f"config file not found: {config_path}")
+    with open(config_path, 'rb') as fh:
+        raw = fh.read()
+    if raw.startswith(b'\xef\xbb\xbf'):
+        raw = raw[3:]
+    try:
+        return tomllib.loads(raw.decode('utf-8'))
+    except tomllib.TOMLDecodeError as e:
+        raise SystemExit(f"{config_path}: invalid TOML -- {e}")
+    except UnicodeDecodeError as e:
+        raise SystemExit(f"{config_path}: not valid UTF-8 -- {e}")
+
+
+def load_params(config_path, preset=None, model_dir=None):
+    """
+    Read config_path, merge [defaults] with the chosen [presets.NAME],
+    and return a params namespace shaped exactly like the one main()
+    expects. Raises SystemExit with an actionable message rather than a
+    traceback for the mistakes a user actually makes (missing file,
+    unknown preset, bad construction_plane, primary_dir along the normal).
+    """
+    cfg = _read_toml(config_path)
+
+    defaults = dict(cfg.get('defaults', {}))
+    presets = cfg.get('presets', {})
+    if not presets:
+        raise SystemExit(f"{config_path} defines no [presets.*] sections")
+
+    if preset is None:
+        if len(presets) == 1:
+            preset = next(iter(presets))
+        else:
+            raise SystemExit(
+                "--preset is required; available: "
+                + ", ".join(sorted(presets)))
+    if preset not in presets:
+        raise SystemExit(
+            f"unknown preset '{preset}'; available: "
+            + ", ".join(sorted(presets)))
+
+    merged = {**defaults, **presets[preset]}
+
+    base_dir = model_dir or merged.get('model_dir') or os.path.dirname(
+        os.path.abspath(config_path))
+    merged.pop('model_dir', None)
+    for key in _PATH_KEYS:
+        merged[key] = _resolve_path(merged.get(key, ""), base_dir)
+
+    plane = merged.pop('construction_plane', 'XZ')
+    if plane not in PLANE_DEFS:
+        raise SystemExit(
+            f"construction_plane '{plane}' is not one of "
+            + ", ".join(sorted(PLANE_DEFS)))
+    pdef = PLANE_DEFS[plane]
+
+    pd = merged.get('primary_dir')
+    if pd is None or len(pd) != 3:
+        raise SystemExit("primary_dir must be a list of three numbers")
+    merged['primary_dir'] = FreeCAD.Vector(*(float(c) for c in pd))
+
+    params = SimpleNamespace(**merged)
+    params.construction_plane = plane
     params.plane_normal = pdef['normal']
     params.plane_axis_u = pdef['axis_u']
     params.plane_axis_v = pdef['axis_v']
 
-    if params.primary_dir is not None:
-        n = params.plane_normal
-        pd = params.primary_dir
-        dot = pd.x * n.x + pd.y * n.y + pd.z * n.z
-        proj = FreeCAD.Vector(pd.x - dot * n.x, pd.y - dot * n.y, pd.z - dot * n.z)
-        if proj.Length > 1e-6:
-            params.primary_dir = proj.normalize()
-        else:
-            # primary_dir is (anti)parallel to the construction plane's
-            # normal, so projecting it into the plane leaves nothing.
-            # main() dereferences primary_dir unconditionally, so falling
-            # back to None here just defers the failure into a confusing
-            # AttributeError -- fail loudly and say what to change.
-            raise ValueError(
-                f"primary_dir {(pd.x, pd.y, pd.z)} is parallel to the "
-                f"'{construction_plane}' plane normal {(n.x, n.y, n.z)}; it must "
-                f"lie IN the construction plane. Pick a construction_plane whose "
-                f"normal is not parallel to primary_dir."
-            )
+    # primary_dir must lie IN the construction plane, never along its
+    # normal: it doubles as the in-plane reference direction for the rib
+    # grid, and create_angled_grid_lines computes
+    # cross(plane_normal, primary_dir), which is degenerate when the two
+    # are parallel. Projecting it into the plane leaves nothing in that
+    # case, and main() dereferences primary_dir unconditionally, so
+    # falling through would only defer the failure into a confusing
+    # AttributeError. Fail here and say what to change.
+    n, pd = params.plane_normal, params.primary_dir
+    dot = pd.x * n.x + pd.y * n.y + pd.z * n.z
+    proj = FreeCAD.Vector(pd.x - dot * n.x, pd.y - dot * n.y, pd.z - dot * n.z)
+    if proj.Length <= 1e-6:
+        raise SystemExit(
+            f"primary_dir {(pd.x, pd.y, pd.z)} is parallel to the '{plane}' "
+            f"plane normal {(n.x, n.y, n.z)}; it must lie IN the construction "
+            f"plane. Pick a construction_plane whose normal is not parallel "
+            f"to primary_dir (slicing along Y needs 'XY' or 'YZ', not 'XZ')."
+        )
+    params.primary_dir = proj.normalize()
+    return params
 
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Generate rib/bridge/hole structure inside a wing "
+                    "and export a slicer-ready STL.")
+    ap.add_argument('--config', default=None,
+                    help="TOML config file (default: config.toml next to main.py)")
+    ap.add_argument('--preset', default=None,
+                    help="which [presets.NAME] to run")
+    ap.add_argument('--model-dir', default=None,
+                    help="base directory for relative paths in the config "
+                         "(default: the config file's own directory)")
+    ap.add_argument('--list-presets', action='store_true',
+                    help="print the available presets and exit")
+    return ap.parse_args(argv)
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    config_path = args.config or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'config.toml')
+
+    if args.list_presets:
+        names = sorted(_read_toml(config_path).get('presets', {}))
+        print(f"{config_path}:")
+        for name in names:
+            print(f"  {name}")
+        raise SystemExit(0)
+
+    params = load_params(config_path, args.preset, args.model_dir)
+    print(f"Preset '{args.preset or 'default'}' from {config_path}")
     main(params)

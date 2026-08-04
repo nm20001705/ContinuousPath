@@ -1,0 +1,102 @@
+# ContinuousPath configuration
+#
+# Run with:   python main.py --preset wingR1
+#             python main.py --preset fin --config my_config.toml
+#
+# [defaults] holds everything shared; each [presets.NAME] overrides only
+# what differs for that model. Paths may be absolute, or relative to the
+# directory this config file lives in.
+
+[defaults]
+
+# ---- Model ----------------------------------------------------------
+# doc_path   : the FreeCAD document to open
+# obj_name   : the object inside it to cut. It MUST be a closed,
+#              single-shell solid with a positive volume. Note that
+#              Part.Shape.isValid() does NOT check this -- it validates
+#              individual faces, so a broken mesh-derived solid can
+#              report valid=True while being unusable. main.py checks
+#              closed/shells/volume up front and says so.
+# out_path   : where the finished STL is written
+# input_step_path : set instead of doc_path to import a STEP file
+doc_path = ""
+obj_name = ""
+out_path = ""
+input_step_path = ""
+
+# ---- Rib grid -------------------------------------------------------
+# construction_plane : 'XY', 'XZ' or 'YZ'. The rib grid is generated in
+#              this plane and the rib slabs stand along its normal.
+# primary_dir : the slicing axis, AND the in-plane reference direction
+#              for the rib grid. It must LIE IN construction_plane, never
+#              along its normal -- create_angled_grid_lines computes
+#              cross(plane_normal, primary_dir), which is degenerate when
+#              the two are parallel. So slicing along Y needs 'XY' or
+#              'YZ', never 'XZ' (whose normal IS Y).
+# rib_angle / grid_orientation : degrees. Avoid making
+#              (grid_orientation +/- rib_angle) land on 90 deg -- that
+#              makes the rib plane perpendicular to primary_dir and the
+#              whole rib family is silently dropped.
+construction_plane = "XZ"
+primary_dir = [0.0, 0.0, 1.0]
+rib_spacing = 30.0
+rib_angle = 30.0
+grid_orientation = 0.0
+
+# ---- Feature sizes (mm) ---------------------------------------------
+# thickness  : wall thickness of the rib material
+# bridge_height : bridge width. Bridges are generated at every slice that
+#              has solid to sit in; where the section is thinner than
+#              this the bridge is clamped to the available width rather
+#              than skipped.
+# hole_margin : clearance kept around holes. The effective margin is
+#              hole_margin + thickness/2, and the point_condition curve
+#              is mapped onto the span AFTER that margin is removed.
+# rib_protrusion_margin : how far each rib slab extends past the wing's
+#              bounding box, guaranteeing it cuts fully through the skin.
+# z_step     : slice spacing along primary_dir. Smaller is finer and
+#              slower; note this steps along primary_dir, so switching
+#              that axis can change the slice count dramatically.
+thickness = 0.1
+bridge_height = 1.0
+hole_margin = 0.8
+rib_protrusion_margin = 2.0
+z_step = 1.0
+
+# ---- Visualisation --------------------------------------------------
+# Each adds an object to the FreeCAD document. vis_final also controls
+# whether the expensive final cut runs at all.
+vis_rib_centre_surfaces = false
+vis_rib_centre_surfaces_clip = false
+vis_rib_segments = true
+vis_centre_lines = false
+vis_bridge = true
+vis_hole = true
+vis_wing = false
+vis_rib_solid = true
+vis_final = true
+
+
+# =====================================================================
+# Presets
+# =====================================================================
+
+[presets.wingR1]
+doc_path = "wingR1.FCStd"
+obj_name = "WingR1_fixed001_solid"
+out_path = "wingR1.stl"
+
+[presets.wingR2]
+doc_path = "wing.FCStd"
+obj_name = "WingR2_msv001_solid"
+out_path = "wingR2.stl"
+
+[presets.wingR3]
+doc_path = "wing.FCStd"
+obj_name = "WingR3_msv001_solid"
+out_path = "wingR3.stl"
+
+[presets.fin]
+doc_path = "fin.FCStd"
+obj_name = "Part__Feature_solid"
+out_path = "fin.stl"
