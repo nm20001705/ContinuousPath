@@ -51,78 +51,11 @@ def show_shape(obj_name, shape, doc, color=None, transparency=None,
     doc.recompute()
     return obj
 
-def show_cut_wing(shape, doc, transparency=80):
-    return show_shape("CutWing", shape, doc, transparency=transparency, display_mode="Shaded")
-
 def show_rib_centre_lines(lines, doc, line_color=(1.0,0.0,0.0)):
     compound = Part.Compound([line for line in lines])
     return show_shape("RibCentreLines", compound, doc, line_color=line_color, line_width=2)
-
-def show_midpoints(points, doc, point_size=5, color=(1.0,0.0,0.0)):
-    vertices = [Part.Vertex(p) for p in points]
-    compound = Part.Compound(vertices)
-    return show_shape("Midpoints", compound, doc, color=color, point_size=point_size, display_mode="Points")
-
-def show_rib_wires(wires, doc, line_color=(0.0,1.0,0.0), line_width=2):
-    compound = Part.Compound(wires)
-    return show_shape("RibWires", compound, doc, line_color=line_color, line_width=line_width)
-
-def show_bridges(shape, doc, color=(0.0,0.8,0.0), transparency=30):
-    return show_shape("Bridges", shape, doc, color=color, transparency=transparency, display_mode="Shaded")
-
-def show_final_solid(shape, doc, color=(0.8,0.8,0.8), transparency=80):
-    return show_shape("WingWithBridges", shape, doc, color=color, transparency=transparency, display_mode="Shaded")
 
 def fit_view(doc):
     if FreeCAD.GuiUp:
         FreeCADGui.SendMsgToActiveView("ViewFit")
 
-def show_rib_centre_surfaces(faces, doc, color=(0.6, 0.6, 0.9), transparency=60):
-    """
-    Display the rib centre surfaces (mid‑plane trimmed to wing).
-    """
-    if not faces:
-        return None
-    compound = Part.Compound(faces)
-    return show_shape("RibCentreSurfaces", compound, doc, color=color, transparency=transparency)
-
-def show_rib_solids_trimmed(rib_solids, doc, color=(0.5, 0.7, 0.5), transparency=50):
-    """
-    Display the rib solids that have been trimmed to the wing.
-    """
-    if not rib_solids:
-        return None
-    compound = Part.Compound(rib_solids)
-    return show_shape("RibSolids", compound, doc, color=color, transparency=transparency)
-
-def show_rib_centre_edges(edges, doc, line_color=(0.2, 0.5, 1.0), line_width=2):
-    """
-    Display the intersection edges of the rib planes with the wing.
-    """
-    if not edges:
-        return None
-    compound = Part.Compound(edges)
-    return show_shape("RibCentreEdges", compound, doc, line_color=line_color, line_width=line_width)
-
-def show_rib_segments(pieces, doc, color=(0.2, 0.8, 0.4), transparency=30):
-    """
-    Display all rib face segments as a single compound.
-    pieces: flat list of Part.Face from split_rib_faces_by_crossings.
-    """
-    if not pieces:
-        print("show_rib_segments: no pieces to show.")
-        return None
-    valid = [p for p in pieces if p is not None and not p.isNull()]
-    if not valid:
-        print("show_rib_segments: all pieces are null.")
-        return None
-    compound = Part.Compound(valid)
-    return show_shape("RibSegments", compound, doc,
-                      color=color, transparency=transparency)
-
-def show_rect_cutouts(faces, doc, color=(1.0,0.5,0.0), transparency=30):
-    """Display the rectangular cutout faces (orange)."""
-    if not faces:
-        return None
-    compound = Part.Compound(faces)
-    return show_shape("RectCutouts", compound, doc, color=color, transparency=transparency, display_mode="Shaded")

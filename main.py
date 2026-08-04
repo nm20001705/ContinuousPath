@@ -26,7 +26,6 @@ from hole_utils import create_holes_analytical
 from rib_slice_core import basis_vectors
 from viz_utils import fit_view, show_rib_centre_lines
 
-from rib_solid_utils import build_rib_solid_analytical
 from assembly_utils_freecad import (assemble_final_wing_freecad,
                                     assemble_final_wing_trimesh)
 from rib_solid_utils import build_full_rib_solid
@@ -144,52 +143,6 @@ def precompute_slices(wing_mesh, prim, z_step, d_min, d_max):
 
     pbar.close()
     return np.array(z_vals), slices
-
-# ------------------------------------------------------------
-# Improved mesh repair (preserves intentional holes)
-# ------------------------------------------------------------
-def repair_mesh(mesh, max_hole=3.0):
-    """
-    Minimal repair that fixes defects up to `max_hole` mm while preserving
-    large intentional holes (servo cutouts, lightening holes).
-    """
-    if mesh is None:
-        return None
-    if isinstance(mesh, trimesh.Scene):
-        meshes = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
-        if not meshes:
-            return None
-        mesh = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
-        if mesh is None:
-            return None
-    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
-        return None
-
-    # Clean up vertices and degenerate faces
-    try:
-        mesh.merge_vertices()
-    except:
-        pass
-    try:
-        mesh.update_faces(mesh.nondegenerate_faces())
-    except:
-        pass
-    try:
-        mesh.fix_normals()
-    except:
-        pass
-
-    # Fill holes up to `max_hole` mm – close small defects but keep the servo hole
-    try:
-        mesh = trimesh.repair.fill_holes(mesh, max_hole=max_hole)
-    except:
-        pass
-    try:
-        mesh.fix_normals()
-    except:
-        pass
-
-    return mesh
 
 # ------------------------------------------------------------
 # Main function
