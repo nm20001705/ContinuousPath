@@ -30,60 +30,51 @@ see the README's *Input requirements*.
 
 ## Looking at the result
 
-```powershell
-python examples/make_preview.py
-```
+![the example wing with its internal rib structure](example_preview.png)
 
-Writes `example_preview.svg`, a planform section through the finished
-part.
+Open `example_wing_structured.stl` in a viewer, or load the FreeCAD
+document. Two rib families cross at ±30°; the lens shapes are the
+lightening holes, and the short bars at each crossing are the bridges.
 
-**Slice it in the right plane or you will think nothing happened.** The
-rib grid runs *through* the thickness, so:
+**If you section it, pick the right plane or you will think nothing
+happened.** The rib grid runs *through* the thickness, so:
 
 | section plane | what it shows |
 |---|---|
-| planform (perpendicular to thickness) | the full grid — 6 outlines, 29 boundaries |
+| planform (perpendicular to thickness) | the full grid |
 | airfoil (perpendicular to span) | a single closed loop |
 
-The airfoil section staying one loop is not a failure — it is the
-bridges working. They deliberately keep the part in one piece so the
-nozzle never has to retract. Only 1.35% of the material is gone; the
-structure is the *slit pattern*, not a hollowed interior.
+The airfoil section staying one loop is not a failure — it is the bridges
+working. They deliberately keep the part in one piece so the nozzle never
+has to retract. Only 1.35% of the material is gone; the structure is the
+*slit pattern*, not a hollowed interior.
 
-## Regenerating the input
+## Where the wing came from
 
-`example_wing.FCStd` is committed, but it is generated, not hand-modelled:
+`example_wing.FCStd` is generated, not hand-modelled or downloaded. It is
+a loft through NACA 4-digit sections — root chord 100 mm, tip 55 mm,
+200 mm span, 35 mm sweep, −3° washout — giving a closed 65-face solid of
+123,589 mm³.
 
-```powershell
-& 'C:\Program Files\FreeCAD 1.1\bin\python.exe' examples/make_example_wing.py
-```
+The airfoil comes from the published NACA formula, so the example is
+original to this project and carries no third-party model licence. That
+matters: this repository deliberately contains no downloaded geometry.
 
-It lofts NACA 4-digit sections (root chord 100 mm, tip 55 mm, 200 mm
-span, 35 mm sweep, −3° washout) into a closed 65-face solid. The airfoil
-comes from the published NACA formula, so the example is original to this
-project and carries no third-party model licence.
-
-Two deliberate choices, both learned the hard way:
-
-- **Saved as `.FCStd`, not STEP.** STEP has no single authoritative unit.
-  FreeCAD's importer applies a per-machine preference, and a round-trip
-  here came back scaled by 25.4 — turning the 200 mm wing into a 5 m one
-  and the run into a multi-thousand-slice crawl. The generator now
-  re-opens what it wrote and fails if the volume moved.
-- **A smooth loft, not a ruled one.** 65 real surfaces instead of 192
-  planar strips, and 22 KB instead of 672 KB. It is also the better
-  example: a handful of genuine surfaces is what well-formed input to
-  this tool looks like, as opposed to the mesh-derived solids that make
-  the BREP path pathological.
+It is saved as `.FCStd` rather than STEP on purpose. STEP has no single
+authoritative unit — FreeCAD's importer applies a per-machine preference,
+and a round-trip of this wing came back scaled by 25.4, turning a 200 mm
+span into 5 m and the run into a multi-thousand-slice crawl. An example
+that silently depends on a local setting is worse than no example.
 
 ## A note on previews
 
-The `example` preset turns the `vis_*` flags off. The pipeline writes its
-preview meshes into the input document and saves it, which took
-`example_wing.FCStd` from 22 KB to 741 KB and left it dirty in git.
+The `example` preset turns the `vis_*` flags off, because the pipeline
+writes its preview meshes into the input document and saves it. Leaving
+them on inflates `example_wing.FCStd` and leaves it dirty in git.
 
-To inspect the intermediate geometry in the FreeCAD GUI, turn the flags
-on in `config.toml`, run, then reset the document:
+To inspect the intermediate geometry (rib segments, bridges, holes) in
+the FreeCAD GUI, turn the flags on in `config.toml`, run, then reset the
+document afterwards:
 
 ```powershell
 git checkout examples/example_wing.FCStd

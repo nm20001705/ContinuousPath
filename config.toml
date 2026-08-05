@@ -92,7 +92,6 @@ vis_final = true
 #
 #     python main.py --preset example
 #
-# Generate/regenerate the input with examples/make_example_wing.py.
 # Feature sizes are scaled down from the defaults because this wing is
 # only 200mm span and 12mm thick.
 [presets.example]

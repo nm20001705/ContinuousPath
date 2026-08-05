@@ -86,14 +86,15 @@ about 10 seconds, no model of your own required:
 
 ```powershell
 & 'C:\Program Files\FreeCAD 1.1\bin\python.exe' main.py --preset example
-python examples/make_preview.py     # writes a planform section as SVG
 ```
 
-![example wing planform section](examples/example_preview.svg)
+![the example wing with its internal rib structure](examples/example_preview.png)
 
-The outline is the wing; every internal boundary is a rib or a lightening
-hole. See `examples/README.md` for what the numbers should look like —
-and for why an *airfoil* section still shows a single closed loop.
+Two rib families crossing at ±30°, the lens-shaped lightening holes that
+keep them from being solid walls, and the small bridges at each crossing
+that hold the part in one piece so the nozzle never has to retract.
+
+See `examples/README.md` for the numbers a good run prints.
 
 ## Running it
 
