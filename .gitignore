@@ -53,3 +53,6 @@ config.local.toml
 examples/*.stl
 examples/*.pkl
 examples/*.FCBak
+
+# local editor settings (machine-specific FreeCAD path)
+settings.json
