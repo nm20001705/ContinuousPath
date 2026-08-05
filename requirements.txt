@@ -1,0 +1,24 @@
+# Runtime dependencies for the core geometry pipeline.
+#
+# NOTE: FreeCAD itself is NOT installable from pip. The FreeCAD-dependent
+# parts of this project (main.py, slab_utils, viz_utils,
+# assembly_utils_freecad) must run under FreeCAD's own bundled Python:
+#
+#     & 'C:\Program Files\FreeCAD 1.1\bin\python.exe' main.py --preset wingR1
+#
+# The pure-geometry modules (rib_slice_core, solidify_utils,
+# mesh_simplify_utils) have no FreeCAD import and run under any Python
+# with the packages below -- which is what the test suite exercises.
+
+numpy>=1.24
+trimesh>=4.0
+shapely>=2.0
+scipy>=1.10
+
+# Boolean backend. tree_union() and the final assembly default to
+# engine='manifold'; without it the booleans fall back to slower and less
+# robust engines, so treat this as required rather than optional.
+manifold3d>=2.3
+
+# Progress bars during slice precomputation.
+tqdm>=4.64

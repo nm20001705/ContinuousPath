@@ -1,0 +1,11 @@
+# Development dependencies (adds the test runner to the runtime set).
+#
+# Run the core tests with any Python that has these installed:
+#     python -m pytest
+#
+# They deliberately do NOT require FreeCAD -- see tests/README.md for
+# what that covers and what it leaves untested.
+
+-r requirements.txt
+
+pytest>=7.0

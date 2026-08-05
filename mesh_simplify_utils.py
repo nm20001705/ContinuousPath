@@ -110,3 +110,62 @@ def merge_coplanar_faces(mesh, min_group_size=4):
     print(f"merge_coplanar_faces: {len(mesh.faces)} -> {len(result.faces)} faces "
           f"({merged_count} originals merged)")
     return result
+
+
+def drop_sliver_components(mesh, min_volume=1e-6, verbose=True):
+    """
+    Remove zero-volume debris the boolean leaves along the slit edges.
+
+    Cutting 0.1mm-thick slabs out of a wing produces a lot of very thin
+    geometry, and the boolean sheds a handful of degenerate scraps: on
+    this wing, 7 extra "components" totalling 46 faces, every one of them
+    with |volume| == 0.00 (largest 10.55 x 0.09 x 0.00 mm -- a flat
+    ribbon with no thickness at all). They are harmless to slicers but
+    they make the exported STL report watertight=False, which hides real
+    problems.
+
+    Components are dropped on VOLUME, not on size or count, so a
+    genuinely detached but solid piece (which this design can legitimately
+    produce, since full-depth slabs can isolate a cell) is always kept.
+    """
+    if mesh is None:
+        return mesh
+    try:
+        comps = mesh.split(only_watertight=False)
+    except Exception as e:
+        if verbose:
+            print(f"  sliver cleanup skipped ({e})")
+        return mesh
+
+    if len(comps) <= 1:
+        return mesh
+
+    keep = [c for c in comps if abs(c.volume) >= min_volume]
+    dropped = len(comps) - len(keep)
+    if not keep or dropped == 0:
+        return mesh
+
+    # Take the surviving components exactly as split() produced them. Do
+    # NOT merge_vertices() here: around 0.1mm slits there are legitimately
+    # distinct vertices a hair apart, and welding them creates
+    # non-manifold edges -- that alone turned a watertight result into a
+    # leaky one, even though every dropped component was a closed
+    # zero-volume shell that removing could not possibly open.
+    out = trimesh.util.concatenate(keep) if len(keep) > 1 else keep[0]
+
+    # Dropping whole components must not open the parts we keep. Deleting
+    # degenerate FACES would (a watertight mesh can need zero-area faces
+    # to stay closed), which is why this only ever removes complete
+    # components -- and verifies afterwards, reverting if it went wrong.
+    if mesh.is_watertight and not out.is_watertight:
+        if verbose:
+            print("  sliver cleanup would break watertightness -- keeping "
+                  "the mesh intact instead")
+        return mesh
+
+    if verbose:
+        lost = len(mesh.faces) - len(out.faces)
+        print(f"  dropped {dropped} zero-volume sliver component(s) "
+              f"({lost} faces); {len(keep)} solid part(s) kept, "
+              f"watertight={out.is_watertight}")
+    return out
