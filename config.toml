@@ -87,6 +87,35 @@ vis_final = true
 # Presets
 # =====================================================================
 
+# The one preset that works straight from a fresh clone -- it needs no
+# FreeCAD document, just the STEP file committed alongside it:
+#
+#     python main.py --preset example
+#
+# Generate/regenerate the input with examples/make_example_wing.py.
+# Feature sizes are scaled down from the defaults because this wing is
+# only 200mm span and 12mm thick.
+[presets.example]
+doc_path = "examples/example_wing.FCStd"
+obj_name = "ExampleWing"
+out_path = "examples/example_wing_structured.stl"
+rib_spacing = 22.0
+thickness = 0.4
+bridge_height = 1.2
+hole_margin = 0.6
+z_step = 1.0
+# Previews are off here so the run stays read-only with respect to the
+# committed document. The pipeline writes its preview meshes into the
+# input file and saves it, which took example_wing.FCStd from 22KB to
+# 741KB and left it showing as modified in git. Turn these on when
+# inspecting the example in the FreeCAD GUI, then `git checkout` the
+# document afterwards.
+vis_rib_segments = false
+vis_bridge = false
+vis_hole = false
+vis_rib_solid = false
+vis_final = false
+
 [presets.wingR1]
 doc_path = "wingR1.FCStd"
 obj_name = "WingR1_fixed001_solid"

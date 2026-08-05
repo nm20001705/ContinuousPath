@@ -48,3 +48,8 @@ venv/
 
 # local machine-specific config (paths etc.)
 config.local.toml
+
+# generated example outputs (the .FCStd input IS tracked; these are not)
+examples/*.stl
+examples/*.pkl
+examples/*.FCBak

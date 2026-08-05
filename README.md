@@ -79,6 +79,22 @@ Run it with FreeCAD's own bundled interpreter:
 `manifold3d` is required, not optional — the booleans default to
 `engine='manifold'`.
 
+## Try it
+
+A small example wing is included and runs straight from a fresh clone —
+about 10 seconds, no model of your own required:
+
+```powershell
+& 'C:\Program Files\FreeCAD 1.1\bin\python.exe' main.py --preset example
+python examples/make_preview.py     # writes a planform section as SVG
+```
+
+![example wing planform section](examples/example_preview.svg)
+
+The outline is the wing; every internal boundary is a rib or a lightening
+hole. See `examples/README.md` for what the numbers should look like —
+and for why an *airfoil* section still shows a single closed loop.
+
 ## Running it
 
 Parameters live in `config.toml` as a `[defaults]` block plus named
@@ -192,11 +208,6 @@ conversion and the assembly booleans still need an end-to-end run.
 The output is an ordinary STL. Slice it with **no infill and no support**
 — the structure is already in the geometry.
 
-One caveat: a swept or tapered part stood on end will trigger overhang
-warnings that have nothing to do with the ribs. On the reference wing the
-*uncut* input already had unsupported area in 189 of 282 layers, so check
-the original in your slicer before attributing an overhang warning to
-this tool.
 
 ## Licence
 
