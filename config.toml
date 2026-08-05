@@ -9,6 +9,12 @@
 
 [defaults]
 
+# Base directory that relative paths below resolve against. Leave unset
+# (or absent) to resolve them against this config file's own directory.
+# Override per run with --model-dir. Keep machine-specific values in a
+# gitignored config.local.toml rather than editing this file.
+# model_dir = "D:/models/my_plane"
+
 # ---- Model ----------------------------------------------------------
 # doc_path   : the FreeCAD document to open
 # obj_name   : the object inside it to cut. It MUST be a closed,
