@@ -449,7 +449,8 @@ def main(params):
     final_mesh = None
     if getattr(params, 'trimesh_assembly', True) and wing_mesh.is_watertight:
         final_mesh, _ = assemble_final_wing_trimesh(
-            wing_mesh, rib_solid, bridge_solid, hole_solid)
+            wing_mesh, rib_solid, bridge_solid, hole_solid,
+            max_fragment_volume=getattr(params, 'max_fragment_volume', 0.0))
 
     if final_mesh is None:
         print("Using the BREP assembly path...")

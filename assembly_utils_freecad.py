@@ -98,7 +98,8 @@ def trimesh_to_part_solid(tm, tolerance=0.01):
     return solid
 
 def assemble_final_wing_trimesh(wing_mesh_tm, rib_solid_tm, bridge_solid_tm,
-                                 hole_solid_tm, boolean_engine='manifold'):
+                                 hole_solid_tm, boolean_engine='manifold',
+                                 max_fragment_volume=0.0):
     """
     Do the whole assembly in trimesh: wing - (rib - bridge - hole).
 
@@ -143,7 +144,8 @@ def assemble_final_wing_trimesh(wing_mesh_tm, rib_solid_tm, bridge_solid_tm,
         print(f"assemble_final_wing_trimesh: wing - cut_solid failed: {e}")
         return None, cut_solid_tm
 
-    final = drop_sliver_components(final)
+    final = drop_sliver_components(
+        final, max_fragment_volume=max_fragment_volume)
 
     removed = wing_mesh_tm.volume - final.volume
     print(f"Final (trimesh): {len(final.faces)} faces, "

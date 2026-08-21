@@ -69,6 +69,15 @@ hole_margin = 0.8
 rib_protrusion_margin = 2.0
 z_step = 1.0
 
+# Detached crumbs under this volume (mm^3) are removed from the result.
+# Every rib slit is meant to be bridged, so a finished part should come
+# out as ONE body; a detached piece means something else severed it --
+# usually a gap already in the source model. They print as loose specks
+# inside the part. 0 disables removal, and disconnected bodies are always
+# reported with their size and location either way, so raise this only
+# after checking what is actually being discarded.
+max_fragment_volume = 0.0
+
 # ---- Visualisation --------------------------------------------------
 # Each adds an object to the FreeCAD document. vis_final also controls
 # whether the expensive final cut runs at all.

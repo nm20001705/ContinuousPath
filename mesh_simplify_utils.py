@@ -112,7 +112,8 @@ def merge_coplanar_faces(mesh, min_group_size=4):
     return result
 
 
-def drop_sliver_components(mesh, min_volume=1e-6, verbose=True):
+def drop_sliver_components(mesh, min_volume=1e-6, verbose=True,
+                           max_fragment_volume=0.0):
     """
     Remove zero-volume debris the boolean leaves along the slit edges.
 
@@ -141,6 +142,34 @@ def drop_sliver_components(mesh, min_volume=1e-6, verbose=True):
         return mesh
 
     keep = [c for c in comps if abs(c.volume) >= min_volume]
+
+    # Anything still detached after the zero-volume debris is gone is a
+    # solid crumb the bridges failed to hold on to. In this design every
+    # rib slit is meant to be bridged, so a finished part should come out
+    # as ONE body -- a detached piece means something else severed it,
+    # typically a gap already present in the source model (on this
+    # project's wingR1a, a malformed aileron hinge slot at Z~30 left two
+    # crumbs of 7.31 and 0.03 mm^3). They print as loose specks inside the
+    # part, so they are worth naming even when they are not removed.
+    if len(keep) > 1:
+        ranked = sorted(keep, key=lambda c: -abs(c.volume))
+        total = sum(abs(c.volume) for c in ranked)
+        crumbs = [c for c in ranked[1:]
+                  if abs(c.volume) < max_fragment_volume]
+        if verbose:
+            print(f"  NOTE: {len(ranked)} disconnected bodies in the result "
+                  f"(largest {abs(ranked[0].volume):.1f} mm^3 of {total:.1f}):")
+            for c in ranked[1:6]:
+                lo, hi = c.bounds
+                print(f"    {abs(c.volume):10.2f} mm^3 at "
+                      f"X {lo[0]:.1f}..{hi[0]:.1f}  Y {lo[1]:.1f}..{hi[1]:.1f}  "
+                      f"Z {lo[2]:.1f}..{hi[2]:.1f}")
+        if crumbs and max_fragment_volume > 0:
+            keep = [c for c in keep if c not in crumbs]
+            if verbose:
+                print(f"  dropping {len(crumbs)} detached crumb(s) under "
+                      f"{max_fragment_volume} mm^3")
+
     dropped = len(comps) - len(keep)
     if not keep or dropped == 0:
         return mesh
