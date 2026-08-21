@@ -11,6 +11,7 @@ import trimesh
 from shapely.affinity import affine_transform
 from shapely.geometry import Polygon as ShapelyPolygon
 
+from mesh_simplify_utils import strip_degenerate_faces
 from viz_utils import show_mesh
 
 def repair_mesh(mesh):
@@ -30,32 +31,41 @@ def repair_mesh(mesh):
     if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
         return None
 
-    # Safe, non‑shape‑altering operations
     try:
         mesh.merge_vertices()
-    except:
-        pass
-    try:
-        mesh.update_faces(mesh.nondegenerate_faces())
-    except:
-        pass
-    try:
-        mesh.fix_normals()
-    except:
+    except Exception:
         pass
 
-    # Fill only very small holes (≤0.1 mm) to fix mesh defects without closing
-    # intentional cutouts which are typically much larger.
-    try:
-        mesh = trimesh.repair.fill_holes(mesh, max_hole=0.1)
-    except:
-        pass
+    # Dropping degenerate faces WILL open a watertight mesh. A tessellation
+    # can contain a sliver triangle that carries no area but is still the
+    # only thing joining its three neighbours; deleting it leaves a
+    # three-edge hole. On this project's wing_bore inputs exactly one such
+    # face existed, and removing it flipped watertight True -> False, which
+    # dropped the run onto the slow BREP path and hung it -- even though the
+    # untouched tessellation was a perfectly good volume.
+    #
+    # So keep the cleanup only when it is actually harmless. If the mesh was
+    # already watertight, that is the best state available and nothing here
+    # can improve on it.
+    mesh = strip_degenerate_faces(mesh)
 
-    # Re‑apply normals after hole filling
     try:
         mesh.fix_normals()
-    except:
+    except Exception:
         pass
+
+    # Only attempt hole filling if there are holes. trimesh's fill_holes
+    # takes no size limit -- the previous `max_hole=0.1` argument does not
+    # exist, so this call raised every single time and was swallowed by a
+    # bare `except:`, meaning it never ran. It also patches in place and
+    # returns a bool, so its result must not be assigned back over the mesh
+    # (the old code would have replaced the mesh with `True` had it worked).
+    if not mesh.is_watertight:
+        try:
+            trimesh.repair.fill_holes(mesh)
+            mesh.fix_normals()
+        except Exception:
+            pass
 
     return mesh
 

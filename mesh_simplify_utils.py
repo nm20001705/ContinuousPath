@@ -169,3 +169,39 @@ def drop_sliver_components(mesh, min_volume=1e-6, verbose=True):
               f"({lost} faces); {len(keep)} solid part(s) kept, "
               f"watertight={out.is_watertight}")
     return out
+
+
+def strip_degenerate_faces(mesh, verbose=False):
+    """
+    Drop zero-area faces, but never at the cost of watertightness.
+
+    Removing degenerate triangles looks like an unconditionally safe
+    cleanup and is not. A tessellation can contain a sliver that carries
+    no area yet is still the only thing joining its three neighbours;
+    deleting it leaves a three-edge hole.
+
+    That is not hypothetical: on two of this project's inputs exactly ONE
+    such face existed, and stripping it flipped the mesh from watertight
+    to leaky. That in turn dropped the run off the fast trimesh path onto
+    the BREP one, where it hung -- while the untouched tessellation had
+    been a perfectly good volume all along.
+
+    So the cleanup is applied only when it does not open the mesh. If the
+    input was already watertight, that is the best state available and
+    nothing here can improve on it.
+    """
+    if mesh is None:
+        return mesh
+    try:
+        candidate = mesh.copy()
+        candidate.update_faces(candidate.nondegenerate_faces())
+    except Exception:
+        return mesh
+
+    if mesh.is_watertight and not candidate.is_watertight:
+        if verbose:
+            n = len(mesh.faces) - len(candidate.faces)
+            print(f"  keeping {n} degenerate face(s): removing them would "
+                  f"open an otherwise watertight mesh")
+        return mesh
+    return candidate

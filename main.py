@@ -184,13 +184,24 @@ def main(params):
         _problems.append("not closed")
     if len(wing_shape.Shells) > 1:
         _problems.append(f"{len(wing_shape.Shells)} shells (expected 1)")
-    if wing_shape.Volume <= 0:
+    # A negative volume on an otherwise closed single-shell solid just
+    # means the shell is inside-out, which the tessellation does not
+    # inherit -- so it is a warning, not a disqualification. Only the
+    # magnitude being implausible would matter, and that shows up as an
+    # unclosed shape instead.
+    _inverted = (wing_shape.Volume < 0 and wing_shape.isClosed()
+                 and len(wing_shape.Shells) == 1)
+    if wing_shape.Volume <= 0 and not _inverted:
         _problems.append(f"non-positive volume ({wing_shape.Volume:.1f})")
+
     if _problems:
         print("  *** INPUT IS NOT A CLOSED SOLID: " + "; ".join(_problems) + " ***")
         print("  The rib cut will be unreliable and may be extremely slow. "
-              "Regenerate this object as a closed single-shell solid "
-              "(WingR2/WingR3 in this project are correct examples).")
+              "Regenerate this object as a closed single-shell solid.")
+    elif _inverted:
+        print(f"  note: volume is negative ({wing_shape.Volume:.1f}) -- the BREP "
+              f"shell is inside-out. Harmless here: the cut runs on the "
+              f"tessellation, which comes out correctly oriented.")
     elif len(wing_shape.Faces) > 50000:
         print(f"  note: {len(wing_shape.Faces)} faces is very high (a "
               f"mesh-derived solid). Valid, but the BREP cut scales roughly "

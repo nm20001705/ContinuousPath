@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import trimesh
 
-from mesh_simplify_utils import drop_sliver_components
+from mesh_simplify_utils import drop_sliver_components, strip_degenerate_faces
 
 
 def box(extents=(1.0, 1.0, 1.0), translate=(0.0, 0.0, 0.0)):
@@ -109,6 +109,74 @@ def test_many_faced_zero_volume_debris_is_still_dropped():
 
     assert len(comps) == 2, "ribbon dropped, both solids kept"
     assert out.volume == pytest.approx(8.0 + 0.064, rel=1e-6)
+
+
+def sliver_welded_box():
+    """A watertight box in which one triangle has effectively zero area.
+
+    Splitting a box face into two triangles and then nudging the split
+    vertex onto the diagonal leaves a sliver that carries no area but is
+    still the only thing joining its neighbours. Deleting it opens a
+    three-edge hole -- which is precisely what happened on the wing_bore
+    inputs, where exactly one such face existed.
+    """
+    m = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    m = m.subdivide()
+    m.merge_vertices()
+    # collapse one vertex onto a neighbour, making its incident faces degenerate
+    v = m.vertices.copy()
+    faces = m.faces
+    a, b = faces[0][0], faces[0][1]
+    v[a] = v[b] + (v[a] - v[b]) * 1e-9
+    out = trimesh.Trimesh(vertices=v, faces=faces, process=False)
+    return out
+
+
+def test_stripping_degenerates_never_opens_a_watertight_mesh():
+    """Regression guard for the wing_bore hang.
+
+    repair_mesh used to call update_faces(nondegenerate_faces())
+    unconditionally. On two inputs that removed exactly ONE zero-area
+    triangle and flipped the mesh from watertight to leaky, which pushed
+    the run onto the BREP path and hung it -- even though the untouched
+    tessellation was a perfectly good volume.
+
+    The fixture reproduces that shape: stripping really does remove faces
+    and really would open the mesh, so this is not vacuous.
+    """
+    mesh = sliver_welded_box()
+    assert mesh.is_watertight, "fixture must start watertight"
+
+    naive = mesh.copy()
+    naive.update_faces(naive.nondegenerate_faces())
+    assert len(naive.faces) < len(mesh.faces), "fixture must have degenerates"
+    assert not naive.is_watertight, (
+        "fixture must demonstrate that naive stripping opens the mesh, "
+        "otherwise this test proves nothing")
+
+    guarded = strip_degenerate_faces(mesh)
+    assert guarded.is_watertight, (
+        "strip_degenerate_faces must keep the intact mesh rather than open "
+        "it -- opening it is what dropped wingR1a/wingR2 onto the slow BREP "
+        "path")
+    assert len(guarded.faces) == len(mesh.faces)
+
+
+def test_degenerates_are_still_stripped_when_it_is_safe():
+    """The guard must not disable the cleanup outright -- on a mesh that is
+    already open, dropping junk faces costs nothing and is worth doing."""
+    v = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0],
+                  [0.0, 1.0, 0.0]])
+    f = np.array([[0, 1, 3], [0, 1, 2]])      # second face is collinear
+    mesh = trimesh.Trimesh(vertices=v, faces=f, process=False)
+    assert not mesh.is_watertight
+
+    out = strip_degenerate_faces(mesh)
+    assert len(out.faces) < len(mesh.faces), "safe cleanup should still apply"
+
+
+def test_strip_degenerate_faces_handles_none():
+    assert strip_degenerate_faces(None) is None
 
 
 def test_single_component_mesh_is_returned_untouched():
